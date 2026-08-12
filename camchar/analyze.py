@@ -21,6 +21,7 @@ from pathlib import Path
 import numpy as np
 
 from .io_utils import stem_for
+from .plots import save_linearity_plot
 
 CLIP_DN = 65400  # anything >= this is clipped (IMX174: 4094<<4 = 65504)
 DARK_CURRENT_FLAT_MAX = 0.02  # exposures <= 20 ms: dark-current shot noise negligible
@@ -145,7 +146,13 @@ def analyze_flats(seq, dark):
                 f"  {e0 * 1000:7.2f}->{e1 * 1000:7.2f} ms  ratio {s1 / s0:.3f} "
                 f"(ideal {e1 / e0:.3f})"
             )
-    return {"K12": K12, "sigma_r_e": sigma_r_e, "Nsat": K12 * 4094}
+    return {
+        "K12": K12,
+        "sigma_r_e": sigma_r_e,
+        "Nsat": K12 * 4094,
+        "rows": rows,
+        "bias_dn": dark["bias_dn"],
+    }
 
 
 def run(data_dir, roi=None):
@@ -164,7 +171,9 @@ def run(data_dir, roi=None):
             f"(bias fit {dk['bias_fit_dn']:.2f})"
         )
         print(f"  read noise (temporal sigma, dark): {dk['sigma_r_dn']:.2f} DN16")
-        analyze_flats(load_sequence(data_dir, "flat"), dk)
+        flat = analyze_flats(load_sequence(data_dir, "flat"), dk)
+        if flat:
+            save_linearity_plot(flat["rows"], flat["bias_dn"], "outputs", CLIP_DN, roi)
 
 
 def main(argv=None):

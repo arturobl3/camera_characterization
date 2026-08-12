@@ -11,7 +11,7 @@
 ## Hardware dependence
 
 - `get-dark-frames` / `get-flat-frames` require a physically connected Player One camera (direct USB, no hub). Don't run acquisition commands as a code check.
-- `analyze` is offline: reads `<data>/dark/` + `<data>/flat/` via their `metadata.json`.
+- `analyze` is offline: reads `<data>/dark/` + `<data>/flat/` via their `metadata.json`; writes plots to `outputs/` (CWD, gitignored) via `camchar/plots.py` (matplotlib, Agg backend).
 - The backend retries camera enumeration for up to 60 s at `open()` by design (USB enumeration is flaky); don't shorten or remove this.
 
 ## Player One SDK — deliberate workarounds, do not "fix"

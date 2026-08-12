@@ -6,6 +6,9 @@ __pycache__/
 # Data (acquired sequences are large; keep them out of version control)
 data/
 
+# Generated plots
+outputs/
+
 # uv
 uv.lock
 
