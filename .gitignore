@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Data (acquired sequences are large; keep them out of version control)
+data/
+
+# uv
+uv.lock
+
+# macOS
+.DS_Store
+
+#opencode
+.opencode
+
+#vscode
+settings.json
