@@ -1,24 +1,25 @@
 """CLI entry point.
 
 Usage examples:
-  python -m camchar get-dark-frames --out data/dark \\
-      --exposures 0.1,0.5,1.0,2.0 --frames 20 --gain 0
-  python -m camchar get-flat-frames --out data/flat \\
-      --exposures 0.01,0.05,0.1 --frames 20 --gain 0 --notes "green LED ~530nm, 30cm"
+  python -m camchar get-dark-frames --exposures 0.1,0.5,1.0,2.0 --frames 20 --gain 0
+  python -m camchar get-flat-frames --exposures 0.01,0.05,0.1 --frames 20 \\
+      --gain 0 --notes "green LED ~530nm, 30cm"
   python -m camchar warmup-sensor
 
 Camera must be on and connected. Lens cap ON for dark frames; uniform
-illumination (diffuser) for flat frames.
+illumination (diffuser) for flat frames. Frames are saved under
+<out>/<vendor>_<model>_(<sensor>)/dark|flat (--out defaults to 'data').
 """
 
 import argparse
 import math
 import sys
 import time
+from pathlib import Path
 
 from .analyze import run as analyze_run
 from .backends import get_backend
-from .io_utils import save_sequence
+from .io_utils import camera_dir_name, save_sequence
 
 DEFAULT_DARK_EXPOSURES = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.5, 2.0]
 DEFAULT_FLAT_EXPOSURES = [0.01, 0.05, 0.1, 0.5, 1.0]
@@ -50,7 +51,9 @@ def _run_sequence(args, seq_type):
     )
     backend.configure(gain=args.gain)
     temp = backend.sensor_temp_c()
+    out_dir = Path(args.out) / camera_dir_name(info) / seq_type
     print(f"[{seq_type}] sensor temp: {temp:.1f} C, gain: {args.gain}")
+    print(f"[{seq_type}] saving to {out_dir}")
 
     total_frames = 0
     t0 = __import__("time").time()
@@ -60,7 +63,7 @@ def _run_sequence(args, seq_type):
         stack = backend.snap(exp, args.frames)
         temp_after = backend.sensor_temp_c()
         save_sequence(
-            args.out,
+            out_dir,
             seq_type,
             exp,
             args.gain,
@@ -76,7 +79,7 @@ def _run_sequence(args, seq_type):
     elapsed = __import__("time").time() - t0
     print(
         f"[{seq_type}] done: {len(args.exposures)} exposures, {total_frames} frames, "
-        f"{elapsed / 60:.1f} min -> {args.out}"
+        f"{elapsed / 60:.1f} min -> {out_dir}"
     )
     backend.close()
 
@@ -189,7 +192,12 @@ def main(argv=None):
         ("get-flat-frames", DEFAULT_FLAT_EXPOSURES, "flat"),
     ):
         sp = sub.add_parser(cmd)
-        sp.add_argument("--out", required=True, help="output directory")
+        sp.add_argument(
+            "--out",
+            default="data",
+            help="root output directory; frames go to "
+            "<out>/<vendor>_<model>_(<sensor>)/dark|flat (default: data)",
+        )
         sp.add_argument(
             "--exposures",
             type=_parse_exposures,
@@ -214,7 +222,8 @@ def main(argv=None):
     sp.add_argument(
         "--data",
         default="data",
-        help="directory with dark/ and flat/ subdirs (default: data)",
+        help="data root or camera dir <root>/<vendor>_<model>_(<sensor>); "
+        "a single camera dir under a root is auto-discovered (default: data)",
     )
     sp.add_argument(
         "--roi",

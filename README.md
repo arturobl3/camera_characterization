@@ -16,10 +16,10 @@ uv sync                      # creates .venv, installs camchar + numpy (uv.lock)
 uv run camchar warmup-sensor
 
 # dark frames: lens cap ON, dark room
-uv run camchar get-dark-frames --out data/dark \
+uv run camchar get-dark-frames \
     --exposures 0.001,0.01,0.1,0.5,2.0 --frames 20 --gain 0
-# flat frames: uniform broadband illumination (halogen + diffuser, or LED)
-uv run camchar get-flat-frames --out data/flat \
+# flat frames: uniform broadband illumination (halogen + diffuser, or LED flat panel)
+uv run camchar get-flat-frames \
     --exposures 0.01,0.05,0.1,0.5 --frames 20 --gain 0 \
     --notes "green LED ~530nm, diffuser, 30 cm"
 
@@ -31,6 +31,9 @@ uv run camchar analyze --data data
 module are interchangeable; on Windows lab machines run the same commands from
 a `uv sync`'d checkout.
 
+Acquired sequences are organized per camera:
+`<data root>/<vendor>_<model>_(<sensor>)/{dark,flat}/` (default root `data`,
+override with `--out`), e.g. `data/playerone_Apollo-M_(IMX174)/dark/`.
 Each exposure writes `{seq}_{exp}ms|us_g{gain}.npy` (uint16 stack, n×h×w) plus an
 append-only `metadata.json` with camera info, exposure, gain, sensor temp
 (`temp_start_c`/`temp_c`, before/after each exposure), notes.
@@ -39,20 +42,25 @@ Sub-ms / fractional-ms exposures use microsecond names (e.g. `flat_004500us`).
 ## CLI
 
 ```
-camchar get-dark-frames --out DIR [--exposures S,S,...] [--frames N] [--gain G] [--notes TXT]
-camchar get-flat-frames --out DIR [--exposures S,S,...] [--frames N] [--gain G] [--notes TXT]
+camchar get-dark-frames [--out ROOT] [--exposures S,S,...] [--frames N] [--gain G] [--notes TXT]
+camchar get-flat-frames [--out ROOT] [--exposures S,S,...] [--frames N] [--gain G] [--notes TXT]
 camchar analyze --data DIR [--roi r0:r1:c0:c1]
 camchar warmup-sensor
 ```
 
 Defaults: dark 0.001–2.0 s (9 points), flat 0.01–1.0 s (5 points), 20 frames each, gain 0.
-`warmup-sensor` runs continuous 0.5 s exposures and prints the timestamped sensor
+`--out` defaults to `data`; frames are written to
+`<out>/<vendor>_<model>_(<sensor>)/dark|flat/`.
+`warmup-sensor` runs continuous 0.1 s exposures and prints the timestamped sensor
 temperature; it declares the temperature stable once it stays within 0.3 °C over the
 last 2 min and auto-stops 1 min after that (Ctrl+C to stop earlier). Run it before
 acquiring so darks/flats are taken at thermal equilibrium.
-`analyze` reads `<data>/dark/` + `<data>/flat/` from metadata.json, reports K
-(e⁻/DN12), read noise (e⁻, from darks), dark current (DN/s), N_sat (e⁻),
-PRNU (%), bias floor, per-point gain check and exposure linearity. ROI defaults
+`analyze` accepts the data root (`data`) or a camera dir directly
+(`data/playerone_Apollo-M_(IMX174)`); a single camera dir under the root is
+auto-discovered. It reads `<camera>/dark/` + `<camera>/flat/` from metadata.json,
+reports K (e⁻/DN12), read noise (e⁻, from darks), dark current (DN/s), N_sat (e⁻),
+PRNU (%), bias floor, per-point gain check and exposure linearity, and writes plots
+(linearity, PTC, SNR) to `outputs/<vendor>_<model>_(<sensor>)/`. ROI defaults
 to a central 200×200 patch (600:800:850:1050); only the ROI needs uniform
 illumination.
 
@@ -73,7 +81,12 @@ camera_characterization/
 │       ├── lib/               # SDK binary for YOUR OS (see below)
 │       └── py/                # vendored pyPOACamera.py (platform-aware loading)
 ├── pyproject.toml             # uv-managed: uv sync, uv run camchar ...
-└── data/                      # acquired sequences (gitignored)
+├── data/                      # acquired sequences (gitignored)
+│   └── playerone_Apollo-M_(IMX174)/
+│       ├── dark/              # .npy stacks + metadata.json
+│       └── flat/
+└── outputs/                   # plots per camera (gitignored)
+    └── playerone_Apollo-M_(IMX174)/
 ```
 
 Add a vendor: implement `CameraBackend` in `camchar/backends/<vendor>.py`, decorate

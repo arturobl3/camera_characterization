@@ -20,11 +20,74 @@ from pathlib import Path
 
 import numpy as np
 
-from .io_utils import stem_for
-from .plots import save_linearity_plot
+from .io_utils import camera_dir_name, stem_for
+from .plots import save_linearity_plot, save_ptc_plot, save_snr_plot
 
 CLIP_DN = 65400  # anything >= this is clipped (IMX174: 4094<<4 = 65504)
 DARK_CURRENT_FLAT_MAX = 0.02  # exposures <= 20 ms: dark-current shot noise negligible
+
+_VENDOR_NAMES = {"playerone": "Player One"}
+
+
+def load_camera_meta(data_dir):
+    """First metadata entry with a camera model, or None."""
+    for seq_type in ("dark", "flat"):
+        meta_path = Path(data_dir) / seq_type / "metadata.json"
+        if not meta_path.exists():
+            continue
+        entries = json.loads(meta_path.read_text())
+        for m in entries:
+            if m.get("model"):
+                return m
+    return None
+
+
+def load_camera_info(data_dir):
+    """Camera display label like 'Player One Apollo-M (IMX174)' from metadata."""
+    m = load_camera_meta(data_dir)
+    if not m:
+        return None
+    vendor = m.get("vendor", "")
+    label = f"{_VENDOR_NAMES.get(vendor, vendor)} {m['model']}"
+    if m.get("sensor"):
+        label += f" ({m['sensor']})"
+    return label
+
+
+def resolve_data_dir(data_dir):
+    """Camera dir (containing dark/ and/or flat/) under data_dir.
+
+    data_dir itself is returned when it already contains dark/ or flat/ (legacy
+    layout). Otherwise subdirs with metadata.json are scanned: exactly one is
+    used; several or none produce an error listing the choices.
+    """
+    d = Path(data_dir)
+    if not d.exists():
+        print(f"  ! data dir not found: {d}")
+        return None
+    if (d / "dark").exists() or (d / "flat").exists():
+        return d
+    candidates = [
+        sub
+        for sub in sorted(d.iterdir())
+        if sub.is_dir()
+        and (
+            (sub / "dark" / "metadata.json").exists()
+            or (sub / "flat" / "metadata.json").exists()
+        )
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        print(
+            f"  ! no camera data under {d} "
+            f"(expected <root>/<vendor>_<model>_(<sensor>)/dark|flat)"
+        )
+        return None
+    print("  ! multiple camera dirs found -- pass one explicitly with --data:")
+    for c in candidates:
+        print(f"      {c}")
+    return None
 
 
 def load_sequence(data_dir, seq_type):
@@ -63,8 +126,10 @@ def analyze_dark(seq):
     print("=== DARK ===")
     if not seq:
         return None
+    rows = []
     for exp_s, st in seq:
         s = roi_stats(st, ROI)
+        rows.append((exp_s, s))
         print(
             f"  {exp_s * 1000:8.1f} ms  mean {s['mean']:8.2f}  "
             f"tvar {s['tvar']:9.2f}  svar {s['svar']:9.2f}"
@@ -85,6 +150,7 @@ def analyze_dark(seq):
         "dark_current_dn_per_s": slope,
         "sigma_r_dn": sigma_r,
         "bias_fit_dn": intercept,
+        "rows": rows,
     }
 
 
@@ -109,6 +175,8 @@ def analyze_flats(seq, dark):
     S = np.array([u[0] for u in usable])
     V = np.array([u[1] for u in usable])
     K_fit, b = np.polyfit(S, V, 1)
+    V_hat = np.polyval([K_fit, b], S)
+    ptc_r2 = 1.0 - np.sum((V - V_hat) ** 2) / np.sum((V - V.mean()) ** 2)
     K12 = 16.0 / K_fit  # DN16 -> DN12: K12 = 16/(V16/S16)
     sigma_r_e = dark["sigma_r_dn"] * K12 / 16.0
     prnu = []
@@ -152,6 +220,9 @@ def analyze_flats(seq, dark):
         "Nsat": K12 * 4094,
         "rows": rows,
         "bias_dn": dark["bias_dn"],
+        "ptc_slope": K_fit,
+        "ptc_intercept": b,
+        "ptc_r2": ptc_r2,
     }
 
 
@@ -159,21 +230,31 @@ def run(data_dir, roi=None):
     global ROI
     ROI = tuple(slice(a, b) for a, b in zip(roi[0::2], roi[1::2]))
 
+    cam_dir = resolve_data_dir(data_dir)
+    if cam_dir is None:
+        return
     print(
-        f"Analyzing {Path(data_dir).resolve()}  (ROI rows {roi[0]}:{roi[1]}, "
+        f"Analyzing {cam_dir.resolve()}  (ROI rows {roi[0]}:{roi[1]}, "
         f"cols {roi[2]}:{roi[3]})"
     )
-    dk = analyze_dark(load_sequence(data_dir, "dark"))
+    dk = analyze_dark(load_sequence(cam_dir, "dark"))
     if dk:
+        camera = load_camera_info(cam_dir)
+        meta = load_camera_meta(cam_dir)
+        out_dir = Path("outputs") / (camera_dir_name(meta) if meta else cam_dir.name)
         print(f"\n  bias floor (shortest exp): {dk['bias_dn']:.2f} DN16")
         print(
             f"  dark current: {dk['dark_current_dn_per_s']:.4f} DN16/s  "
             f"(bias fit {dk['bias_fit_dn']:.2f})"
         )
         print(f"  read noise (temporal sigma, dark): {dk['sigma_r_dn']:.2f} DN16")
-        flat = analyze_flats(load_sequence(data_dir, "flat"), dk)
+        flat = analyze_flats(load_sequence(cam_dir, "flat"), dk)
         if flat:
-            save_linearity_plot(flat["rows"], flat["bias_dn"], "outputs", CLIP_DN, roi)
+            save_linearity_plot(
+                flat["rows"], flat["bias_dn"], out_dir, CLIP_DN, roi, camera
+            )
+            save_ptc_plot(flat, dk, out_dir, CLIP_DN, roi, camera)
+            save_snr_plot(flat, out_dir, CLIP_DN, roi, camera)
 
 
 def main(argv=None):
@@ -183,7 +264,8 @@ def main(argv=None):
     p.add_argument(
         "--data",
         default="data",
-        help="directory with dark/ and flat/ subdirs (default: data)",
+        help="data root or camera dir <root>/<vendor>_<model>_(<sensor>); "
+        "a single camera dir under a root is auto-discovered (default: data)",
     )
     p.add_argument(
         "--roi",

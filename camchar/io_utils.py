@@ -20,6 +20,23 @@ def stem_for(seq_type, exposure_s, gain):
     return f"{seq_type}_{int(round(exp_ms * 1000)):05d}us_g{gain}"
 
 
+def camera_dir_name(info):
+    """Folder name for a camera: 'playerone_Apollo-M_(IMX174)'.
+
+    info is the camera info dict from backend.open() or a metadata entry
+    (needs 'vendor', 'model', 'sensor' keys). Spaces become '-'.
+    """
+    name = "_".join(
+        str(info.get(k, "")).strip()
+        for k in ("vendor", "model")
+        if str(info.get(k, "")).strip()
+    )
+    sensor = str(info.get("sensor", "")).strip()
+    if sensor:
+        name += f"_({sensor})"
+    return name.replace(" ", "-")
+
+
 def save_sequence(
     out_dir,
     seq_type,
