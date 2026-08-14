@@ -23,6 +23,59 @@ def _title_with_camera(base, camera, roi):
     return title
 
 
+def save_dark_plot(rows, out_dir, roi=None, camera=None):
+    """Mean dark DN vs exposure with the dark-current linear fit.
+
+    rows is the 'rows' list from analyze_dark: (exposure_s, stats) with
+    stats['mean']. Saves dark_mean_vs_exposure.png.
+    """
+    x = np.array([e for e, _ in rows]) * 1000
+    y = np.array([s["mean"] for _, s in rows])
+    if len(x) < 2:
+        print("  ! too few dark points for dark plot")
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    yhat = np.polyval([slope, intercept], x)
+    ss_res = float(np.sum((y - yhat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(x, y, "o", ms=5, label="dark (measured)")
+    x_line = np.linspace(x.min(), x.max(), 200)
+    ax.plot(
+        x_line,
+        np.polyval([slope, intercept], x_line),
+        "-",
+        lw=1.5,
+        label="linear fit",
+    )
+    ax.set_xlabel("Exposure (ms)")
+    ax.set_ylabel("Mean DN16")
+    ax.set_title(_title_with_camera("Dark: mean DN vs exposure", camera, roi))
+    ax.legend(loc="lower right")
+    ax.grid(alpha=0.3)
+    ax.text(
+        0.03,
+        0.97,
+        f"y = {slope:.4g}·t {intercept:+.2f} DN16\n"
+        f"R² = {r2:.6f}\n"
+        f"dark current = {slope * 1000:.4f} DN16/s",
+        transform=ax.transAxes,
+        va="top",
+        fontsize=10,
+        bbox=dict(boxstyle="round", fc="white", alpha=0.85),
+    )
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    path = out_path / "dark_mean_vs_exposure.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [plot] saved {path}")
+    return {"slope": slope, "intercept": intercept, "r2": r2}
+
+
 def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
     """Mean DN (bias-subtracted) vs exposure with a linear fit.
 

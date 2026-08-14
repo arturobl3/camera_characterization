@@ -21,10 +21,12 @@ from pathlib import Path
 import numpy as np
 
 from .io_utils import camera_dir_name, stem_for
-from .plots import save_linearity_plot, save_ptc_plot, save_snr_plot
+from .plots import save_dark_plot, save_linearity_plot, save_ptc_plot, save_snr_plot
 
 CLIP_DN = 65400  # anything >= this is clipped (IMX174: 4094<<4 = 65504)
-DARK_CURRENT_FLAT_MAX = 0.02  # exposures <= 20 ms: dark-current shot noise negligible
+DARK_CURRENT_FLAT_MAX_EXP = (
+    0.01  # exposures <= 10 ms: dark-current shot noise negligible
+)
 
 _VENDOR_NAMES = {"playerone": "Player One"}
 
@@ -91,17 +93,26 @@ def resolve_data_dir(data_dir):
 
 
 def load_sequence(data_dir, seq_type):
-    """Return [(exposure_s, stack), ...] sorted, skipping missing files."""
+    """Return [(exposure_s, stack), ...] sorted, skipping missing files.
+
+    Metadata entries are deduped by (exposure_s, gain) -- append-only
+    metadata.json accumulates entries across runs and can hold duplicates.
+    """
     d = Path(data_dir) / seq_type
     meta_path = d / "metadata.json"
     if not meta_path.exists():
         print(f"  ! no metadata at {meta_path} -- nothing to analyze")
         return []
     entries = json.loads(meta_path.read_text())
+    seen = set()
     out = []
     for m in entries:
         if m.get("sequence") != seq_type:
             continue
+        key = (m["exposure_s"], m.get("gain"))
+        if key in seen:
+            continue
+        seen.add(key)
         p = d / f"{stem_for(seq_type, m['exposure_s'], m['gain'])}.npy"
         if not p.exists():
             print(f"  ! missing {p.name}, skipping")
@@ -111,19 +122,69 @@ def load_sequence(data_dir, seq_type):
     return out
 
 
-def roi_stats(stack, roi):
-    """Per-pixel temporal mean/variance + spatial variance inside the ROI."""
+def two_frame_stats(stack, roi):
+    """EMVA 1288 Release 4 two-frame estimates (Eq. 18 + Eq. 32).
+
+    Temporal variance from consecutive non-overlapping pairs (0,1), (2,3), ...:
+        s2y.tf = mean((yA - yB)^2)/2 - (muA - muB)^2/2     (Eq. 18, incl. the
+    Release-4 common-mode mean-difference correction).
+    Spatial variance from the pair covariance (Eq. 32):
+        s2y.tf = mean(yA*yB) - muA*muB
+    which is exactly the fixed-pattern variance (temporal noise is uncorrelated
+    between frames and cancels in the covariance).
+
+    Returns (tf_tvar, tf_svar, tf_tvar_scatter, tf_svar_scatter): pair-averaged
+    estimates plus the std across pairs (a direct uncertainty measure).
+    """
     r = stack[:, roi[0], roi[1]].astype(np.float64)
+    n_pairs = r.shape[0] // 2
+    if n_pairs < 1:
+        return 0.0, 0.0, 0.0, 0.0
+    tvals = np.empty(n_pairs)
+    svals = np.empty(n_pairs)
+    for i in range(n_pairs):
+        a = r[2 * i]
+        b = r[2 * i + 1]
+        mu_a, mu_b = a.mean(), b.mean()
+        d = a - b
+        tvals[i] = 0.5 * (d * d).mean() - 0.5 * (mu_a - mu_b) ** 2
+        svals[i] = (a * b).mean() - mu_a * mu_b
+    return (
+        float(tvals.mean()),
+        float(svals.mean()),
+        float(tvals.std()),
+        float(svals.std()),
+    )
+
+
+def roi_stats(stack, roi):
+    """Per-pixel temporal mean/variance + spatial variance inside the ROI.
+
+    N-frame estimates (mean/variance over all frames) plus the EMVA R4
+    two-frame cross-check values (tf_*), see two_frame_stats().
+
+    Temporal variance uses ddof=1 (EMVA Eq. 44: 1/(L-1)) -- the population
+    (ddof=0) estimator is biased low by (N-1)/N = 5% at N=20, which the
+    two-frame cross-check exposes (K, sigma_r, Nsat all shift). Spatial
+    variance keeps ddof=0 (EMVA spatial sums use 1/(NM); bias < 0.01% at
+    10^4 pixels).
+    """
+    r = stack[:, roi[0], roi[1]].astype(np.float64)
+    tf_t, tf_s, tf_ts, tf_ss = two_frame_stats(stack, roi)
     return {
         "mean": r.mean(),
-        "tvar": r.var(axis=0).mean(),  # temporal variance, avg over pixels
+        "tvar": r.var(axis=0, ddof=1).mean(),  # temporal variance, avg over pixels
         "svar": r.var(axis=1).mean(),  # spatial variance, avg over frames
+        "tf_tvar": tf_t,               # two-frame temporal variance (Eq. 18)
+        "tf_svar": tf_s,               # two-frame spatial variance (Eq. 32)
+        "tf_tvar_scatter": tf_ts,      # pair-to-pair std of tf_tvar
+        "tf_svar_scatter": tf_ss,      # pair-to-pair std of tf_svar
     }
 
 
 def analyze_dark(seq):
     """Bias floor, dark current, read noise from dark frames."""
-    print("=== DARK ===")
+    print("=== DARK (tvar/svar = N-frame; tf = two-frame cross-check) ===")
     if not seq:
         return None
     rows = []
@@ -132,7 +193,8 @@ def analyze_dark(seq):
         rows.append((exp_s, s))
         print(
             f"  {exp_s * 1000:8.1f} ms  mean {s['mean']:8.2f}  "
-            f"tvar {s['tvar']:9.2f}  svar {s['svar']:9.2f}"
+            f"tvar {s['tvar']:9.2f}  tf {s['tf_tvar']:9.2f}  "
+            f"svar {s['svar']:8.2f}  tfs {s['tf_svar']:8.2f}"
         )
 
     t = np.array([e for e, _ in seq])
@@ -142,13 +204,18 @@ def analyze_dark(seq):
 
     # read noise: temporal sigma where tvar is flat (read-noise dominated)
     tvars = np.array(
-        [roi_stats(st, ROI)["tvar"] for e, st in seq if e <= DARK_CURRENT_FLAT_MAX]
+        [roi_stats(st, ROI)["tvar"] for e, st in seq if e <= DARK_CURRENT_FLAT_MAX_EXP]
+    )
+    tf_tvars = np.array(
+        [roi_stats(st, ROI)["tf_tvar"] for e, st in seq if e <= DARK_CURRENT_FLAT_MAX_EXP]
     )
     sigma_r = float(np.sqrt(np.median(tvars)))
+    sigma_r_tf = float(np.sqrt(np.median(tf_tvars)))
     return {
         "bias_dn": bias,
         "dark_current_dn_per_s": slope,
         "sigma_r_dn": sigma_r,
+        "sigma_r_tf_dn": sigma_r_tf,
         "bias_fit_dn": intercept,
         "rows": rows,
     }
@@ -156,7 +223,7 @@ def analyze_dark(seq):
 
 def analyze_flats(seq, dark):
     """K, Nsat, PRNU from the flat sweep (temporal variance)."""
-    print("\n=== FLAT (temporal variance) ===")
+    print("\n=== FLAT (tvar/svar = N-frame; tf = two-frame cross-check) ===")
     if not seq:
         return None
     rows = []
@@ -165,7 +232,8 @@ def analyze_flats(seq, dark):
         rows.append((exp_s, s))
         print(
             f"  {exp_s * 1000:8.1f} ms  mean {s['mean']:10.2f}  "
-            f"tvar {s['tvar']:12.2f}  svar {s['svar']:12.2f}"
+            f"tvar {s['tvar']:12.2f}  tf {s['tf_tvar']:12.2f}  "
+            f"svar {s['svar']:12.2f}  tfs {s['tf_svar']:12.2f}"
         )
 
     usable = [(s["mean"], s["tvar"]) for _, s in rows if s["mean"] < CLIP_DN]
@@ -179,22 +247,57 @@ def analyze_flats(seq, dark):
     ptc_r2 = 1.0 - np.sum((V - V_hat) ** 2) / np.sum((V - V.mean()) ** 2)
     K12 = 16.0 / K_fit  # DN16 -> DN12: K12 = 16/(V16/S16)
     sigma_r_e = dark["sigma_r_dn"] * K12 / 16.0
+    sigma_r_tf_e = dark["sigma_r_tf_dn"] * K12 / 16.0
+
+    # two-frame PTC cross-check: same fit on the Eq. 18 temporal variance
+    V_tf = np.array([s["tf_tvar"] for _, s in rows if s["mean"] < CLIP_DN])
+    K_fit_tf, b_tf = np.polyfit(S, V_tf, 1)
+    K12_tf = 16.0 / K_fit_tf
+
     prnu = []
+    prnu_tf = []
+    dark_tf_svar = (
+        np.median(
+            [
+                s["tf_svar"]
+                for e, s in dark["rows"]
+                if e <= DARK_CURRENT_FLAT_MAX_EXP
+            ]
+        )
+        if dark
+        else 0.0
+    )
     for _, s in rows:
         if 5000 < s["mean"] < 64000:
             prnu.append(np.sqrt(max(s["svar"] - s["tvar"], 0)) / s["mean"])
+            prnu_tf.append(
+                np.sqrt(max(s["tf_svar"] - dark_tf_svar, 0)) / s["mean"]
+            )
 
     print("\n=== PTC FIT (temporal variance) ===")
     print(f"  K (gain)     = {K12:6.2f} e-/DN12   (V/S slope {K_fit:.3f})")
     print(
+        f"  K (two-frame)= {K12_tf:6.2f} e-/DN12   (slope {K_fit_tf:.3f}, "
+        f"Eq. 18; {100 * (K12_tf - K12) / K12:+.1f}% vs N-frame)"
+    )
+    print(
         f"  sigma_r      = {sigma_r_e:6.2f} e-  ({dark['sigma_r_dn']:.2f} DN16, "
         f"{dark['sigma_r_dn'] / 16:.2f} DN12)"
+    )
+    print(
+        f"  sigma_r (tf) = {sigma_r_tf_e:6.2f} e-  "
+        f"({dark['sigma_r_tf_dn']:.2f} DN16)"
     )
     print(f"  Nsat         = {K12 * 4094:7.0f} e- (at 12-bit clip 4094)")
     if prnu:
         print(
             f"  PRNU c       = {np.mean(prnu) * 100:5.2f} %  (upper bound, "
             f"includes diffuser texture)"
+        )
+    if prnu_tf:
+        print(
+            f"  PRNU c (tf)  = {np.mean(prnu_tf) * 100:5.2f} %  (Eq. 32 "
+            f"covariance, DSNU-subtracted)"
         )
     print("\n  per-point gain check (K12 = 16*S/tvar):")
     for exp_s, s in rows:
@@ -248,6 +351,7 @@ def run(data_dir, roi=None):
             f"(bias fit {dk['bias_fit_dn']:.2f})"
         )
         print(f"  read noise (temporal sigma, dark): {dk['sigma_r_dn']:.2f} DN16")
+        save_dark_plot(dk["rows"], out_dir, roi, camera)
         flat = analyze_flats(load_sequence(cam_dir, "flat"), dk)
         if flat:
             save_linearity_plot(

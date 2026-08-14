@@ -63,6 +63,14 @@ PRNU (%), bias floor, per-point gain check and exposure linearity, and writes pl
 (linearity, PTC, SNR) to `outputs/<vendor>_<model>_(<sensor>)/`. ROI defaults
 to a central 200×200 patch (600:800:850:1050); only the ROI needs uniform
 illumination.
+Every quantity is cross-checked with the **EMVA 1288 Release 4 two-frame method**
+(Eq. 18 temporal variance with common-mode correction, Eq. 32 spatial covariance,
+averaged over consecutive pairs) — see the `tf`/`tfs` columns and the
+K/σr/PRNU (tf) lines. N-frame and two-frame values must agree to <~1%; a
+systematic gap signals estimator bias or source non-stationarity. Temporal
+variance uses ddof=1 (EMVA Eq. 44): the ddof=0 population estimator is biased
+low by (N−1)/N (5% at N=20) — this exact bug was caught by the two-frame
+cross-check in the Aug 2026 Apollo-M dataset (K 8.91 → 8.46 e⁻/DN12).
 
 ## Project layout
 
