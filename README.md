@@ -58,8 +58,11 @@ acquiring so darks/flats are taken at thermal equilibrium.
 `analyze` accepts the data root (`data`) or a camera dir directly
 (`data/playerone_Apollo-M_(IMX174)`); a single camera dir under the root is
 auto-discovered. It reads `<camera>/dark/` + `<camera>/flat/` from metadata.json,
-reports K (e⁻/DN12), read noise (e⁻, from darks), dark current (DN/s), N_sat (e⁻),
-PRNU (%), bias floor, per-point gain check and exposure linearity, and writes plots
+reports K (e⁻/DN12), read noise (e⁻, from darks, with an EMVA Eq. 53
+quantization-corrected value), dark current (DN/s, from mean and variance),
+N_sat (e⁻), PRNU (%), bias floor, per-point gain check, exposure linearity,
+EMVA-style saturation / absolute sensitivity threshold / dynamic range, and
+highpass-filtered PRNU1288/DSNU1288 (EMVA 1288 §8.1), and writes plots
 (linearity, PTC, SNR) to `outputs/<vendor>_<model>_(<sensor>)/`. ROI defaults
 to a central 200×200 patch (600:800:850:1050); only the ROI needs uniform
 illumination.
@@ -68,7 +71,7 @@ Every quantity is cross-checked with the **EMVA 1288 Release 4 two-frame method*
 averaged over consecutive pairs) — see the `tf`/`tfs` columns and the
 K/σr/PRNU (tf) lines. N-frame and two-frame values must agree to <~1%; a
 systematic gap signals estimator bias or source non-stationarity. Temporal
-variance uses ddof=1 (EMVA Eq. 44): the ddof=0 population estimator is biased
+variance uses ddof=1 (EMVA R4 Linear Eq. 65): the ddof=0 population estimator is biased
 low by (N−1)/N (5% at N=20) — this exact bug was caught by the two-frame
 cross-check in the Aug 2026 Apollo-M dataset (K 8.91 → 8.46 e⁻/DN12).
 

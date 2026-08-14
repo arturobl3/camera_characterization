@@ -50,17 +50,23 @@ def save_dark_plot(rows, out_dir, roi=None, camera=None):
         lw=1.5,
         label="linear fit",
     )
-    ax.set_xlabel("Exposure (ms)")
-    ax.set_ylabel("Mean DN16")
-    ax.set_title(_title_with_camera("Dark: mean DN vs exposure", camera, roi))
+    ax.set_xlabel(r"$t_{\mathrm{exp}}$ (ms)")
+    ax.set_ylabel(r"$\mu_{y,\mathrm{dark}}$ (DN16)")
+    ax.set_title(
+        _title_with_camera(
+            r"Dark signal $\mu_{y,\mathrm{dark}}$ vs $t_{\mathrm{exp}}$", camera, roi
+        )
+    )
     ax.legend(loc="lower right")
     ax.grid(alpha=0.3)
     ax.text(
         0.03,
         0.97,
-        f"y = {slope:.4g}·t {intercept:+.2f} DN16\n"
-        f"R² = {r2:.6f}\n"
-        f"dark current = {slope * 1000:.4f} DN16/s",
+        rf"$\mu_{{y,\mathrm{{dark}}}} = {slope:.4g}\,t {intercept:+.2f}$ (DN16)"
+        "\n"
+        f"R² = {r2:.6f}"
+        "\n"
+        rf"$\mu_{{I,y}} = {slope * 1000:.4f}$ DN16/s",
         transform=ax.transAxes,
         va="top",
         fontsize=10,
@@ -108,15 +114,23 @@ def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
     )
     x_line = np.linspace(0, float(xf.max()), 200)
     ax.plot(x_line, np.polyval([slope, intercept], x_line), "-", lw=1.5)
-    ax.set_xlabel("Exposure (ms)")
-    ax.set_ylabel("Mean DN16 (bias-subtracted)")
-    ax.set_title(_title_with_camera("Linearity: flat mean DN vs exposure", camera, roi))
+    ax.set_xlabel(r"$t_{\mathrm{exp}}$ (ms)")
+    ax.set_ylabel(r"$\mu_y - \mu_{y,\mathrm{dark}}$ (DN16)")
+    ax.set_title(
+        _title_with_camera(
+            r"Linearity: $\mu_y - \mu_{y,\mathrm{dark}}$ vs $t_{\mathrm{exp}}$",
+            camera,
+            roi,
+        )
+    )
     ax.legend(loc="lower right")
     ax.grid(alpha=0.3)
     ax.text(
         0.03,
         0.97,
-        f"y = {slope:.2f}·t {intercept:+.2f} DN16\nR² = {r2:.6f}",
+        rf"$\mu_y - \mu_{{y,\mathrm{{dark}}}} = {slope:.2f}\,t {intercept:+.2f}$ (DN16)"
+        "\n"
+        f"R² = {r2:.6f}",
         transform=ax.transAxes,
         va="top",
         fontsize=10,
@@ -171,7 +185,7 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
         np.polyval([flat["ptc_slope"], flat["ptc_intercept"]], x_line),
         "-",
         lw=1.5,
-        label="fit V = K_fit·S + b",
+        label="linear fit",
     )
 
     sigma_r2 = dark["sigma_r_dn"] ** 2
@@ -180,13 +194,15 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
         ls="--",
         color="0.4",
         lw=1.2,
-        label=f"read-noise floor (σ_r² = {sigma_r2:.1f})",
+        label=rf"$\sigma_r^2$ read-noise floor = {sigma_r2:.1f} DN16²",
     )
 
-    ax.set_xlabel("Mean DN16")
-    ax.set_ylabel("Temporal variance (DN16²)")
+    ax.set_xlabel(r"$\mu_y$ (DN16)")
+    ax.set_ylabel(r"$\sigma_y^2$ (DN16²)")
     ax.set_title(
-        _title_with_camera("Photon transfer curve (temporal variance)", camera, roi)
+        _title_with_camera(
+            r"Photon transfer curve: $\sigma_y^2$ vs $\mu_y$", camera, roi
+        )
     )
     ax.legend(loc="lower right")
     ax.grid(alpha=0.3)
@@ -194,10 +210,14 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
     ax.text(
         0.03,
         0.97,
-        f"V = {flat['ptc_slope']:.4g}·S {flat['ptc_intercept']:+.1f} DN16²\n"
-        f"R² = {flat['ptc_r2']:.6f}\n"
-        f"K = {flat['K12']:.2f} e⁻/DN12\n"
-        f"σ_r = {dark['sigma_r_dn']:.2f} DN16",
+        rf"$\sigma_y^2 = {flat['ptc_slope']:.4g}\,\mu_y {flat['ptc_intercept']:+.1f}$"
+        " (DN16²)"
+        "\n"
+        f"R² = {flat['ptc_r2']:.6f}"
+        "\n"
+        f"K = {flat['K12']:.2f} e⁻/DN12"
+        "\n"
+        rf"$\sigma_r$ = {dark['sigma_r_dn']:.2f} DN16",
         transform=ax.transAxes,
         va="top",
         fontsize=10,
@@ -218,8 +238,9 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
 
     flat is the return dict from analyze_flats. Signal in electrons is
     bias-subtracted via K12; measured SNR comes from each point's temporal
-    variance. Overlays the fitted noise model (shot + read noise) and the
-    ideal-camera limit SNR = sqrt(S_e). Saves snr_vs_signal.png.
+    variance (EMVA 1288 R4 Linear Eq. 20). Overlays the fitted noise model
+    (shot noise sigma_e^2 = mu_e, Eq. 13, + read noise) and the ideal-camera
+    limit SNR = sqrt(S_e) (Eq. 23). Saves snr_vs_signal.png.
     """
     means = np.array([s["mean"] for _, s in flat["rows"]])
     tvars = np.array([s["tvar"] for _, s in flat["rows"]])
@@ -239,7 +260,7 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
         s_curve / np.sqrt(s_curve + flat["sigma_r_e"] ** 2),
         "-",
         lw=1.5,
-        label="model fit (shot + read noise)",
+        label=r"model: $\mu_e/\sqrt{\mu_e + \sigma_r^2}$",
     )
     ax.loglog(
         s_curve,
@@ -247,20 +268,22 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
         "--",
         lw=1.5,
         color="0.4",
-        label="ideal camera (√S_e)",
+        label=r"ideal camera: $\sqrt{\mu_e}$",
     )
-    ax.set_xlabel("Signal (e⁻)")
+    ax.set_xlabel(r"$\mu_e$ (e⁻)")
     ax.set_ylabel("SNR")
-    ax.set_title(_title_with_camera("SNR vs signal", camera, roi))
+    ax.set_title(_title_with_camera(r"SNR vs $\mu_e$", camera, roi))
     ax.legend(loc="lower right")
     ax.grid(alpha=0.3)
     ax.grid(which="minor", ls="--", alpha=0.3)
     ax.text(
         0.03,
         0.97,
-        f"K = {k12:.2f} e⁻/DN12\n"
-        f"σ_r = {flat['sigma_r_e']:.2f} e⁻\n"
-        f"N_sat = {flat['Nsat']:.0f} e⁻",
+        f"K = {k12:.2f} e⁻/DN12"
+        "\n"
+        rf"$\sigma_r$ = {flat['sigma_r_e']:.2f} e⁻"
+        "\n"
+        rf"$\mu_{{e,\mathrm{{sat}}}}$ = {flat['Nsat']:.0f} e⁻",
         transform=ax.transAxes,
         va="top",
         fontsize=10,
