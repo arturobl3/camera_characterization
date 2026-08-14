@@ -21,4 +21,14 @@ def get_backend(name):
     return _BACKENDS[name]()
 
 
-from . import playerone  # noqa: E402, F401  (registers the playerone backend on import)
+try:
+    from . import playerone  # noqa: E402, F401  (registers the playerone backend on import)
+except OSError as _e:
+    # SDK binary for this OS is missing (vendor/playerone/lib/). Offline
+    # commands (analyze) must still work; fail only if the backend is used.
+    import warnings
+
+    warnings.warn(
+        f"playerone backend unavailable (SDK library not installed): {_e}",
+        stacklevel=2,
+    )

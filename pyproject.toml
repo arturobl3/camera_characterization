@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "matplotlib>=3.11.1",
     "numpy>=2.4.6",
+    "spectral>=0.25",
 ]
 
 [project.scripts]
