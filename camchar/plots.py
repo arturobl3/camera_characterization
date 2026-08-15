@@ -10,17 +10,23 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 _DEFAULT_ROI = (600, 800, 850, 1050)
+_DEFAULT_ROI_SPECIM = (156, 356, 156, 356)
 
 
 def _title_with_camera(base, camera, roi):
     title = base
     if camera:
         title += "\n" + camera
-    if roi and tuple(roi) == _DEFAULT_ROI:
+    if roi and tuple(roi) in (_DEFAULT_ROI, _DEFAULT_ROI_SPECIM):
         title += " (central 200x200 px ROI)"
     elif roi:
         title += f" (ROI rows {roi[0]}:{roi[1]}, cols {roi[2]}:{roi[3]})"
     return title
+
+
+def _band_colors(n):
+    """Distinct colors for per-band curves (viridis ramp)."""
+    return plt.cm.viridis(np.linspace(0.0, 0.9, max(n, 1)))
 
 
 def save_dark_plot(rows, out_dir, roi=None, camera=None):
@@ -80,6 +86,83 @@ def save_dark_plot(rows, out_dir, roi=None, camera=None):
     plt.close(fig)
     print(f"  [plot] saved {path}")
     return {"slope": slope, "intercept": intercept, "r2": r2}
+
+
+def save_dark_variance_plot(rows, out_dir, roi=None, camera=None):
+    """Dark temporal variance vs exposure with the Eq. 30 fit.
+
+    rows is the 'rows' list from analyze_dark: (exposure_s, stats) with
+    stats['tvar']/stats['tf_tvar']. The N-frame fit's slope is the
+    variance-based dark-current estimate and its offset is sigma_r^2
+    (EMVA R4 Linear Eq. 30); the two-frame values are the cross-check.
+    Saves dark_variance_vs_exposure.png.
+    """
+    x = np.array([e for e, _ in rows]) * 1000
+    y = np.array([s["tvar"] for _, s in rows])
+    y_tf = np.array([s["tf_tvar"] for _, s in rows])
+    if len(x) < 2:
+        print("  ! too few dark points for dark variance plot")
+        return None
+    slope, offset = np.polyfit(x, y, 1)
+    slope_tf, offset_tf = np.polyfit(x, y_tf, 1)
+    yhat = np.polyval([slope, offset], x)
+    ss_res = float(np.sum((y - yhat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(x, y, "o", ms=5, label=r"$\sigma_y^2$ (N-frame)")
+    ax.plot(x, y_tf, "s", ms=4, alpha=0.7, label=r"$\sigma_y^2$ (two-frame, Eq. 18)")
+    x_line = np.linspace(x.min(), x.max(), 200)
+    ax.plot(
+        x_line,
+        np.polyval([slope, offset], x_line),
+        "-",
+        lw=1.5,
+        label="Eq. 30 fit (N-frame)",
+    )
+    ax.plot(
+        x_line,
+        np.polyval([slope_tf, offset_tf], x_line),
+        "--",
+        lw=1.5,
+        label="Eq. 30 fit (two-frame)",
+    )
+    ax.set_xlabel(r"$t_{\mathrm{exp}}$ (ms)")
+    ax.set_ylabel(r"$\sigma_{y,\mathrm{dark}}^2$ (DN16²)")
+    ax.set_title(
+        _title_with_camera(
+            r"Dark variance $\sigma_{y,\mathrm{dark}}^2$ vs $t_{\mathrm{exp}}$",
+            camera,
+            roi,
+        )
+    )
+    ax.legend(loc="lower right")
+    ax.grid(alpha=0.3)
+    ax.text(
+        0.03,
+        0.97,
+        rf"$\sigma_y^2 = {slope:.4g}\,t {offset:+.2f}$ (DN16²)"
+        "\n"
+        f"R² = {r2:.6f}"
+        "\n"
+        rf"$\mu_{{I,y}} = {slope * 1000:.4f}$ DN16²/s (Eq. 30 slope)"
+        "\n"
+        rf"$\sigma_r = \sqrt{{\max(\mathrm{{offset}}, 0)}} = "
+        rf"{np.sqrt(max(offset, 0.0)):.2f}$ DN16",
+        transform=ax.transAxes,
+        va="top",
+        fontsize=10,
+        bbox=dict(boxstyle="round", fc="white", alpha=0.85),
+    )
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    path = out_path / "dark_variance_vs_exposure.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [plot] saved {path}")
+    return {"slope": slope, "offset": offset, "r2": r2}
 
 
 def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
@@ -293,6 +376,365 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     path = out_path / "snr_vs_signal.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [plot] saved {path}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Per-band (SPECIM IQ hyperspectral) plots: one curve per selected band.
+# sel_results is the 'results' list from band_analyze filtered to the plotted
+# bands; each entry carries 'wl_nm', 'dark_rows', 'flat_rows', 'dark' (fit
+# dict) and 'flat' (fit dict or None).
+# ---------------------------------------------------------------------------
+
+
+def save_dark_plot_bands(sel_results, out_dir, roi=None, camera=None):
+    """Dark mean DN16 vs exposure, one curve per band.
+
+    Saves dark_mean_vs_exposure_bands.png.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+    drew = False
+    for color, r in zip(_band_colors(len(sel_results)), sel_results):
+        rows = r["dark_rows"]
+        if len(rows) < 2:
+            continue
+        x = np.array([e for e, _ in rows]) * 1000
+        y = np.array([s["mean"] for _, s in rows])
+        ax.plot(
+            x,
+            y,
+            "o-",
+            ms=4,
+            lw=1.2,
+            color=color,
+            label=rf"$\lambda$ {r['wl_nm']:.0f} nm",
+        )
+        drew = True
+    if not drew:
+        print("  ! too few dark points for per-band dark plot")
+        plt.close(fig)
+        return None
+    ax.set_xlabel(r"$t_{\mathrm{exp}}$ (ms)")
+    ax.set_ylabel(r"$\mu_{y,\mathrm{dark}}$ (DN16)")
+    ax.set_title(
+        _title_with_camera(
+            r"Dark signal $\mu_{y,\mathrm{dark}}$ vs $t_{\mathrm{exp}}$ (per band)",
+            camera,
+            roi,
+        )
+    )
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    path = out_path / "dark_mean_vs_exposure_bands.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [plot] saved {path}")
+    return None
+
+
+def save_dark_variance_plot_bands(sel_results, out_dir, roi=None, camera=None):
+    """Dark temporal variance vs exposure, one curve per band (Eq. 30).
+
+    N-frame variance with its linear fit per band; the fit slope is the
+    variance-based dark-current estimate and the offset is sigma_r^2.
+    Saves dark_variance_vs_exposure_bands.png.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+    drew = False
+    for color, r in zip(_band_colors(len(sel_results)), sel_results):
+        rows = r["dark_rows"]
+        if len(rows) < 2:
+            continue
+        x = np.array([e for e, _ in rows]) * 1000
+        y = np.array([s["tvar"] for _, s in rows])
+        ax.plot(
+            x,
+            y,
+            "o-",
+            ms=4,
+            lw=1.2,
+            color=color,
+            label=rf"$\lambda$ {r['wl_nm']:.0f} nm",
+        )
+        slope, offset = np.polyfit(x, y, 1)
+        xl = np.linspace(x.min(), x.max(), 100)
+        ax.plot(
+            xl, np.polyval([slope, offset], xl), "-", lw=1.2, color=color, alpha=0.6
+        )
+        drew = True
+    if not drew:
+        print("  ! too few dark points for per-band dark variance plot")
+        plt.close(fig)
+        return None
+    ax.set_xlabel(r"$t_{\mathrm{exp}}$ (ms)")
+    ax.set_ylabel(r"$\sigma_{y,\mathrm{dark}}^2$ (DN16²)")
+    ax.set_title(
+        _title_with_camera(
+            r"Dark variance $\sigma_{y,\mathrm{dark}}^2$ vs $t_{\mathrm{exp}}$"
+            " (per band)",
+            camera,
+            roi,
+        )
+    )
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    path = out_path / "dark_variance_vs_exposure_bands.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [plot] saved {path}")
+    return None
+
+
+def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
+    """Bias-subtracted flat mean vs exposure, one curve per band (log-log).
+
+    Log-log because the signal level spans orders of magnitude across the
+    spectrum (halogen lamp x sensor QE). Saturated points are marked x and
+    excluded from the curve. Saves linearity_mean_vs_exposure_bands.png.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+    drew = False
+    for color, r in zip(_band_colors(len(sel_results)), sel_results):
+        if not r["flat_rows"] or not r["dark"]:
+            continue
+        rows = r["flat_rows"]
+        bias = r["dark"]["bias_dn"]
+        x = np.array([e for e, _ in rows]) * 1000
+        y = np.array([s["mean"] for _, s in rows]) - bias
+        m = (y > 0) & (np.array([s["mean"] for _, s in rows]) < clip_dn)
+        if m.sum() < 1:
+            continue
+        ax.loglog(
+            x[m],
+            y[m],
+            "o-",
+            ms=4,
+            lw=1.2,
+            color=color,
+            label=rf"$\lambda$ {r['wl_nm']:.0f} nm",
+        )
+        if (~m).any():
+            ax.loglog(x[~m], np.maximum(y[~m], 1.0), "x", ms=7, color=color, alpha=0.7)
+        drew = True
+    if not drew:
+        print("  ! too few unclipped points for per-band linearity plot")
+        plt.close(fig)
+        return None
+    ax.set_xlabel(r"$t_{\mathrm{exp}}$ (ms)")
+    ax.set_ylabel(r"$\mu_y - \mu_{y,\mathrm{dark}}$ (DN16)")
+    ax.set_title(
+        _title_with_camera(
+            r"Linearity: $\mu_y - \mu_{y,\mathrm{dark}}$ vs $t_{\mathrm{exp}}$"
+            " (per band)",
+            camera,
+            roi,
+        )
+    )
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3, which="both")
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    path = out_path / "linearity_mean_vs_exposure_bands.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [plot] saved {path}")
+    return None
+
+
+def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
+    """Log-log photon transfer curve with one curve + fit per band.
+
+    Saves ptc_variance_vs_mean_bands.png.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+    drew = False
+    for color, r in zip(_band_colors(len(sel_results)), sel_results):
+        f = r["flat"]
+        if not f:
+            continue
+        x = np.array([s["mean"] for _, s in f["rows"]])
+        v = np.array([s["tvar"] for _, s in f["rows"]])
+        m = (x < clip_dn) & (v > 0)
+        if m.sum() < 2:
+            continue
+        ax.loglog(
+            x[m],
+            v[m],
+            "o",
+            ms=4,
+            color=color,
+            label=rf"$\lambda$ {r['wl_nm']:.0f} nm: K={f['K12']:.2f}",
+        )
+        xl = np.linspace(x[m].min(), x[m].max(), 100)
+        ax.loglog(
+            xl,
+            np.polyval([f["ptc_slope"], f["ptc_intercept"]], xl),
+            "-",
+            lw=1.2,
+            color=color,
+        )
+        drew = True
+    if not drew:
+        print("  ! too few points for per-band PTC plot")
+        plt.close(fig)
+        return None
+    ax.set_xlabel(r"$\mu_y$ (DN16)")
+    ax.set_ylabel(r"$\sigma_y^2$ (DN16²)")
+    ax.set_title(
+        _title_with_camera(
+            r"Photon transfer curve: $\sigma_y^2$ vs $\mu_y$ (per band)",
+            camera,
+            roi,
+        )
+    )
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(alpha=0.3)
+    ax.grid(which="minor", ls="--", alpha=0.3)
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    path = out_path / "ptc_variance_vs_mean_bands.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [plot] saved {path}")
+    return None
+
+
+def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
+    """SNR vs signal (e-) with one measured curve + model per band.
+
+    Also draws the ideal-camera limit SNR = sqrt(mu_e) (dashed) across the
+    combined signal range of all bands. Saves snr_vs_signal_bands.png.
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+    drew = False
+    sig_lo, sig_hi = [], []
+    for color, r in zip(_band_colors(len(sel_results)), sel_results):
+        f = r["flat"]
+        if not f or not r["dark_rows"]:
+            continue
+        means = np.array([s["mean"] for _, s in f["rows"]])
+        tvars = np.array([s["tvar"] for _, s in f["rows"]])
+        m = (means < clip_dn) & (tvars > 0)
+        if m.sum() < 2:
+            continue
+        signal = (means[m] - f["bias_dn"]) * f["K12"] / 16.0
+        snr = (means[m] - f["bias_dn"]) / np.sqrt(tvars[m])
+        ax.loglog(
+            signal, snr, "o", ms=4, color=color, label=rf"$\lambda$ {r['wl_nm']:.0f} nm"
+        )
+        sc = np.linspace(signal.min(), signal.max(), 100)
+        ax.loglog(sc, sc / np.sqrt(sc + f["sigma_r_e"] ** 2), "-", lw=1.2, color=color)
+        sig_lo.append(signal.min())
+        sig_hi.append(signal.max())
+        drew = True
+    if not drew:
+        print("  ! too few points for per-band SNR plot")
+        plt.close(fig)
+        return None
+    si = np.linspace(min(sig_lo), max(sig_hi), 200)
+    ax.loglog(
+        si,
+        np.sqrt(si),
+        "--",
+        lw=1.5,
+        color="0.4",
+        label=r"ideal camera: $\sqrt{\mu_e}$",
+    )
+    ax.set_xlabel(r"$\mu_e$ (e⁻)")
+    ax.set_ylabel("SNR")
+    ax.set_title(_title_with_camera(r"SNR vs $\mu_e$ (per band)", camera, roi))
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    ax.grid(which="minor", ls="--", alpha=0.3)
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    path = out_path / "snr_vs_signal_bands.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [plot] saved {path}")
+    return None
+
+
+def save_band_parameters_plot(results, selected, out_dir, camera=None):
+    """EMVA parameters vs wavelength: K, sigma_r, dark current, PRNU/DSNU.
+
+    All bands are plotted; the bands chosen for the per-band plots are marked
+    with vertical dotted lines. Saves band_parameters_vs_wavelength.png.
+    """
+    wl = np.array([r["wl_nm"] for r in results])
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    sel_wl = [results[b]["wl_nm"] for b in selected]
+
+    def _pos(a):
+        """Mask non-positive values (degenerate fits) so axes stay readable."""
+        return np.where(np.asarray(a, dtype=float) > 0, a, np.nan)
+
+    def _mark(ax):
+        for w in sel_wl:
+            ax.axvline(w, color="0.5", ls=":", lw=1, alpha=0.7)
+
+    ax = axes[0][0]
+    k = _pos([r["flat"]["K12"] if r["flat"] else np.nan for r in results])
+    ktf = _pos([r["flat"]["K12_tf"] if r["flat"] else np.nan for r in results])
+    ax.plot(wl, k, "o", ms=3, label="K (N-frame)")
+    ax.plot(wl, ktf, ".", ms=3, alpha=0.6, label="K (two-frame)")
+    ax.set_ylabel(r"$K$ (e⁻/DN12)")
+    ax.set_title("System gain $K$")
+    ax.legend(fontsize=9)
+    _mark(ax)
+    ax.grid(alpha=0.3)
+
+    ax = axes[0][1]
+    sr = _pos([r["flat"]["sigma_r_e"] if r["flat"] else np.nan for r in results])
+    srq = _pos([r["flat"]["sigma_r_e_q"] if r["flat"] else np.nan for r in results])
+    ax.plot(wl, sr, "o", ms=3, label=r"$\sigma_r$")
+    ax.plot(wl, srq, ".", ms=3, alpha=0.6, label=r"$\sigma_r$ (Eq. 53 quant-corrected)")
+    ax.set_ylabel(r"$\sigma_r$ (e⁻)")
+    ax.set_title(r"Read noise $\sigma_r$")
+    ax.legend(fontsize=9)
+    _mark(ax)
+    ax.grid(alpha=0.3)
+
+    ax = axes[1][0]
+    dc = np.array([r["dark"]["dark_current_dn_per_s"] for r in results])
+    pos = dc > 0
+    ax.semilogy(wl[pos], dc[pos], "o", ms=3)
+    ax.set_ylabel(r"$\mu_{I,y}$ (DN16/s)")
+    ax.set_xlabel("wavelength (nm)")
+    ax.set_title("Dark current (Eq. 29 mean fit)")
+    _mark(ax)
+    ax.grid(alpha=0.3, which="both")
+
+    ax = axes[1][1]
+    prnu = np.array(
+        [r["extras"]["prnu1288_pct"] if r["extras"] else np.nan for r in results]
+    )
+    ax.plot(wl, prnu, "o", ms=3, color="tab:blue", label="PRNU1288 (%)")
+    ax.set_ylabel("PRNU1288 (%)", color="tab:blue")
+    ax.set_xlabel("wavelength (nm)")
+    ax.set_title("Nonuniformity (highpass, EMVA §8.1)")
+    ax2 = ax.twinx()
+    dsnu = np.array(
+        [r["extras"]["dsnu1288_dn"] if r["extras"] else np.nan for r in results]
+    )
+    ax2.plot(wl, dsnu, ".", ms=3, color="tab:red", label="DSNU1288 (DN16)")
+    ax2.set_ylabel("DSNU1288 (DN16)", color="tab:red")
+    _mark(ax)
+    ax.grid(alpha=0.3)
+
+    if camera:
+        fig.suptitle(f"{camera} -- per-band EMVA 1288 R4 (Linear) parameters")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    path = out_path / "band_parameters_vs_wavelength.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  [plot] saved {path}")

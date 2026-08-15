@@ -27,7 +27,13 @@ from pathlib import Path
 import numpy as np
 
 from .io_utils import camera_dir_name, stem_for
-from .plots import save_dark_plot, save_linearity_plot, save_ptc_plot, save_snr_plot
+from .plots import (
+    save_dark_plot,
+    save_dark_variance_plot,
+    save_linearity_plot,
+    save_ptc_plot,
+    save_snr_plot,
+)
 
 CLIP_DN = 65400  # anything >= this is clipped (IMX174: 4094<<4 = 65504)
 DARK_CURRENT_FLAT_MAX_EXP = (
@@ -36,6 +42,9 @@ DARK_CURRENT_FLAT_MAX_EXP = (
 SAT_MAX_DN = 65504  # sensor digital maximum (12-bit 4094 << 4)
 SAT_CLIP_FRAC = 0.002  # EMVA R4 Linear 6.6: saturation = <= 0.2% pixels at max
 QUANT_STEP_DN16 = 16.0  # DN16 per 12-bit LSB (DN12 << 4 storage)
+
+DEFAULT_ROI = (600, 800, 850, 1050)  # playerone Apollo-M central 200x200
+DEFAULT_ROI_SPECIM = (156, 356, 156, 356)  # SPECIM IQ 512x512 central 200x200
 
 _VENDOR_NAMES = {"playerone": "Player One"}
 
@@ -66,38 +75,47 @@ def load_camera_info(data_dir):
 
 
 def resolve_data_dir(data_dir):
-    """Camera dir (containing dark/ and/or flat/) under data_dir.
+    """(camera_dir, layout) for the data under data_dir, or None.
 
-    data_dir itself is returned when it already contains dark/ or flat/ (legacy
-    layout). Otherwise subdirs with metadata.json are scanned: exactly one is
-    used; several or none produce an error listing the choices.
+    layout 'npy'    -- camchar acquisition layout: <dir>/dark|flat/metadata.json
+    layout 'specim' -- SPECIM IQ export: <dir>/dark frames|flat-field frames
+
+    data_dir itself is accepted when it already holds one of the layouts
+    (legacy data/dark included). Otherwise subdirs are scanned: exactly one
+    camera is used; several or none produce an error listing the choices.
     """
+    from .specim import is_specim_dir  # local: keeps the spectral import lazy
+
     d = Path(data_dir)
     if not d.exists():
         print(f"  ! data dir not found: {d}")
         return None
     if (d / "dark").exists() or (d / "flat").exists():
-        return d
-    candidates = [
-        sub
-        for sub in sorted(d.iterdir())
-        if sub.is_dir()
-        and (
-            (sub / "dark" / "metadata.json").exists()
-            or (sub / "flat" / "metadata.json").exists()
-        )
-    ]
+        return d, "npy"
+    if is_specim_dir(d):
+        return d, "specim"
+    candidates = []
+    for sub in sorted(d.iterdir()):
+        if not sub.is_dir():
+            continue
+        if (sub / "dark" / "metadata.json").exists() or (
+            (sub / "flat" / "metadata.json").exists()
+        ):
+            candidates.append((sub, "npy"))
+        elif is_specim_dir(sub):
+            candidates.append((sub, "specim"))
     if len(candidates) == 1:
         return candidates[0]
     if not candidates:
         print(
             f"  ! no camera data under {d} "
-            f"(expected <root>/<vendor>_<model>_(<sensor>)/dark|flat)"
+            f"(expected <root>/<vendor>_<model>_(<sensor>)/dark|flat "
+            f"or a SPECIM IQ 'dark frames'/'flat-field frames' layout)"
         )
         return None
     print("  ! multiple camera dirs found -- pass one explicitly with --data:")
-    for c in candidates:
-        print(f"      {c}")
+    for c, layout in candidates:
+        print(f"      {c}  ({layout})")
     return None
 
 
@@ -215,6 +233,37 @@ def roi_stats(stack, roi):
     }
 
 
+def fit_dark_stats(rows):
+    """Eq. 29/30 dark fits from roi_stats rows [(exposure_s, stats)] (pure).
+
+    bias is the measured mean of the shortest exposure (not the fit
+    intercept); the Eq. 30 variance-fit slope is the second (variance-based)
+    dark-current estimate.
+    """
+    t = np.array([e for e, _ in rows])
+    mu = np.array([s["mean"] for _, s in rows])
+    tvars = np.array([s["tvar"] for _, s in rows])
+    tf_tvars = np.array([s["tf_tvar"] for _, s in rows])
+
+    slope, intercept = np.polyfit(t, mu, 1)  # Eq. 29: mu_d = mu_d0 + mu_I.y t
+    var_slope, var_offset = np.polyfit(t, tvars, 1)  # Eq. 30
+    _, tf_var_offset = np.polyfit(t, tf_tvars, 1)
+    short = t <= DARK_CURRENT_FLAT_MAX_EXP
+    if short.any():
+        sigma_r_med = float(np.sqrt(np.median(tvars[short])))
+    else:
+        sigma_r_med = float(np.sqrt(np.median(tvars)))  # no short exposure available
+    return {
+        "bias_dn": float(mu[0]),
+        "dark_current_dn_per_s": float(slope),
+        "dark_current_var_dn2_per_s": float(var_slope),
+        "sigma_r_dn": float(np.sqrt(max(var_offset, 0.0))),
+        "sigma_r_tf_dn": float(np.sqrt(max(tf_var_offset, 0.0))),
+        "sigma_r_median_dn": sigma_r_med,
+        "bias_fit_dn": float(intercept),
+    }
+
+
 def analyze_dark(seq):
     """Bias floor, dark current, read noise from dark frames."""
     print("=== DARK (tvar/svar = N-frame; tf = two-frame cross-check) ===")
@@ -230,33 +279,87 @@ def analyze_dark(seq):
             f"svar {s['svar']:8.2f}  tfs {s['tf_svar']:8.2f}"
         )
 
-    t = np.array([e for e, _ in seq])
-    mu = np.array([s["mean"] for _, s in rows])
-    tvars = np.array([s["tvar"] for _, s in rows])
-    tf_tvars = np.array([s["tf_tvar"] for _, s in rows])
+    out = fit_dark_stats(rows)
+    out["rows"] = rows
+    return out
 
-    slope, intercept = np.polyfit(t, mu, 1)  # Eq. 29: mu_d = mu_d0 + mu_I.y t
-    bias = mu[0]
 
-    # Eq. 30: sigma_d^2 = sigma_d0^2 + mu_I t -- the fit offset is the
-    # temporal dark noise, the slope a second (variance) dark-current estimate
-    var_slope, var_offset = np.polyfit(t, tvars, 1)
-    _, tf_var_offset = np.polyfit(t, tf_tvars, 1)
-    sigma_r = float(np.sqrt(max(var_offset, 0.0)))
-    sigma_r_tf = float(np.sqrt(max(tf_var_offset, 0.0)))
+def fit_flat_stats(rows, dark):
+    """PTC fit and derived quantities from roi_stats rows (pure).
 
-    # legacy cross-check: median tvar of the short (read-noise dominated) exposures
-    short = t <= DARK_CURRENT_FLAT_MAX_EXP
-    sigma_r_med = float(np.sqrt(np.median(tvars[short])))
+    Fits V = K_fit*S + b on (mean, tvar) of the usable rows and derives
+    K12 = 16/K_fit, electron-unit read noises (Eq. 53 quantization-corrected
+    variants included) and the quick upper-bound PRNU estimates. Returns
+    None when fewer than 3 unclipped points are available.
+
+    Usable = mean < CLIP_DN *and* sat_frac <= SAT_CLIP_FRAC (EMVA 6.6):
+    heavily-pinned points can sit below the mean threshold while their
+    variance has collapsed (pinned pixels don't fluctuate), which would
+    bend the PTC fit.
+    """
+    usable = [
+        (s["mean"], s["tvar"])
+        for _, s in rows
+        if s["mean"] < CLIP_DN and s["sat_frac"] <= SAT_CLIP_FRAC
+    ]
+    if len(usable) < 3:
+        return None
+    S = np.array([u[0] for u in usable])
+    V = np.array([u[1] for u in usable])
+    K_fit, b = np.polyfit(S, V, 1)
+    V_hat = np.polyval([K_fit, b], S)
+    ptc_r2 = 1.0 - np.sum((V - V_hat) ** 2) / np.sum((V - V.mean()) ** 2)
+    K12 = 16.0 / K_fit  # DN16 -> DN12: K12 = 16/(V16/S16)
+    sigma_r_e = dark["sigma_r_dn"] * K12 / 16.0
+    sigma_r_tf_e = dark["sigma_r_tf_dn"] * K12 / 16.0
+
+    # Eq. 53: subtract the quantization variance (step^2/12) for the
+    # physical-unit dark noise -- 21.3 DN16^2 here, ~14% of the dark variance
+    sig_q2 = QUANT_STEP_DN16**2 / 12.0
+    sigma_r_e_q = np.sqrt(max(dark["sigma_r_dn"] ** 2 - sig_q2, 0.0)) * K12 / 16.0
+    sigma_r_tf_e_q = np.sqrt(max(dark["sigma_r_tf_dn"] ** 2 - sig_q2, 0.0)) * K12 / 16.0
+
+    # two-frame PTC cross-check: same fit on the Eq. 18 temporal variance
+    V_tf = np.array(
+        [
+            s["tf_tvar"]
+            for _, s in rows
+            if s["mean"] < CLIP_DN and s["sat_frac"] <= SAT_CLIP_FRAC
+        ]
+    )
+    K_fit_tf, b_tf = np.polyfit(S, V_tf, 1)
+    K12_tf = 16.0 / K_fit_tf
+
+    prnu = []
+    prnu_tf = []
+    dark_tf_svar = (
+        np.median(
+            [s["tf_svar"] for e, s in dark["rows"] if e <= DARK_CURRENT_FLAT_MAX_EXP]
+        )
+        if dark
+        else 0.0
+    )
+    for _, s in rows:
+        if 5000 < s["mean"] < 64000:
+            prnu.append(np.sqrt(max(s["svar"] - s["tvar"], 0)) / s["mean"])
+            prnu_tf.append(np.sqrt(max(s["tf_svar"] - dark_tf_svar, 0)) / s["mean"])
+
     return {
-        "bias_dn": bias,
-        "dark_current_dn_per_s": slope,
-        "dark_current_var_dn2_per_s": float(var_slope),
-        "sigma_r_dn": sigma_r,
-        "sigma_r_tf_dn": sigma_r_tf,
-        "sigma_r_median_dn": sigma_r_med,
-        "bias_fit_dn": intercept,
-        "rows": rows,
+        "K12": K12,
+        "K12_tf": K12_tf,
+        "sigma_r_e": sigma_r_e,
+        "sigma_r_e_q": sigma_r_e_q,
+        "sigma_r_tf_e": sigma_r_tf_e,
+        "sigma_r_tf_e_q": sigma_r_tf_e_q,
+        "Nsat": K12 * 4094,
+        "bias_dn": dark["bias_dn"],
+        "ptc_slope": K_fit,
+        "ptc_intercept": b,
+        "ptc_slope_tf": K_fit_tf,
+        "ptc_intercept_tf": b_tf,
+        "ptc_r2": ptc_r2,
+        "prnu_pct": float(np.mean(prnu) * 100) if prnu else None,
+        "prnu_tf_pct": float(np.mean(prnu_tf) * 100) if prnu_tf else None,
     }
 
 
@@ -275,48 +378,23 @@ def analyze_flats(seq, dark):
             f"svar {s['svar']:12.2f}  tfs {s['tf_svar']:12.2f}"
         )
 
-    usable = [(s["mean"], s["tvar"]) for _, s in rows if s["mean"] < CLIP_DN]
-    if len(usable) < 3:
+    flat = fit_flat_stats(rows, dark)
+    if flat is None:
         print("  ! too few unclipped points -- check illumination level")
         return None
-    S = np.array([u[0] for u in usable])
-    V = np.array([u[1] for u in usable])
-    K_fit, b = np.polyfit(S, V, 1)
-    V_hat = np.polyval([K_fit, b], S)
-    ptc_r2 = 1.0 - np.sum((V - V_hat) ** 2) / np.sum((V - V.mean()) ** 2)
-    K12 = 16.0 / K_fit  # DN16 -> DN12: K12 = 16/(V16/S16)
-    sigma_r_e = dark["sigma_r_dn"] * K12 / 16.0
-    sigma_r_tf_e = dark["sigma_r_tf_dn"] * K12 / 16.0
+    flat["rows"] = rows
 
-    # Eq. 53: subtract the quantization variance (step^2/12) for the
-    # physical-unit dark noise -- 21.3 DN16^2 here, ~14% of the dark variance
-    sig_q2 = QUANT_STEP_DN16**2 / 12.0
-    sigma_r_e_q = np.sqrt(max(dark["sigma_r_dn"] ** 2 - sig_q2, 0.0)) * K12 / 16.0
-    sigma_r_tf_e_q = np.sqrt(max(dark["sigma_r_tf_dn"] ** 2 - sig_q2, 0.0)) * K12 / 16.0
-
-    # two-frame PTC cross-check: same fit on the Eq. 18 temporal variance
-    V_tf = np.array([s["tf_tvar"] for _, s in rows if s["mean"] < CLIP_DN])
-    K_fit_tf, b_tf = np.polyfit(S, V_tf, 1)
-    K12_tf = 16.0 / K_fit_tf
-
-    prnu = []
-    prnu_tf = []
-    dark_tf_svar = (
-        np.median(
-            [s["tf_svar"] for e, s in dark["rows"] if e <= DARK_CURRENT_FLAT_MAX_EXP]
-        )
-        if dark
-        else 0.0
-    )
-    for _, s in rows:
-        if 5000 < s["mean"] < 64000:
-            prnu.append(np.sqrt(max(s["svar"] - s["tvar"], 0)) / s["mean"])
-            prnu_tf.append(np.sqrt(max(s["tf_svar"] - dark_tf_svar, 0)) / s["mean"])
-
+    K12 = flat["K12"]
+    K12_tf = flat["K12_tf"]
+    sigma_r_e = flat["sigma_r_e"]
+    sigma_r_tf_e = flat["sigma_r_tf_e"]
+    sigma_r_e_q = flat["sigma_r_e_q"]
+    sigma_r_tf_e_q = flat["sigma_r_tf_e_q"]
     print("\n=== PTC FIT (temporal variance) ===")
-    print(f"  K (gain)     = {K12:6.2f} e-/DN12   (V/S slope {K_fit:.3f})")
+    print(f"  K (gain)     = {K12:6.2f} e-/DN12   (V/S slope {flat['ptc_slope']:.3f})")
     print(
-        f"  K (two-frame)= {K12_tf:6.2f} e-/DN12   (slope {K_fit_tf:.3f}, "
+        f"  K (two-frame)= {K12_tf:6.2f} e-/DN12   "
+        f"(slope {flat['ptc_slope_tf']:.3f}, "
         f"Eq. 18; {100 * (K12_tf - K12) / K12:+.1f}% vs N-frame)"
     )
     print(
@@ -327,15 +405,15 @@ def analyze_flats(seq, dark):
         f"  sigma_r (tf) = {sigma_r_tf_e:6.2f} e-  ({dark['sigma_r_tf_dn']:.2f} DN16; "
         f"corrected {sigma_r_tf_e_q:.2f} e-)"
     )
-    print(f"  Nsat         = {K12 * 4094:7.0f} e- (at 12-bit clip 4094)")
-    if prnu:
+    print(f"  Nsat         = {flat['Nsat']:7.0f} e- (at 12-bit clip 4094)")
+    if flat["prnu_pct"] is not None:
         print(
-            f"  PRNU c       = {np.mean(prnu) * 100:5.2f} %  (upper bound, "
+            f"  PRNU c       = {flat['prnu_pct']:5.2f} %  (upper bound, "
             f"includes diffuser texture)"
         )
-    if prnu_tf:
+    if flat["prnu_tf_pct"] is not None:
         print(
-            f"  PRNU c (tf)  = {np.mean(prnu_tf) * 100:5.2f} %  (Eq. 32 "
+            f"  PRNU c (tf)  = {flat['prnu_tf_pct']:5.2f} %  (Eq. 32 "
             f"covariance, DSNU-subtracted)"
         )
     print("\n  per-point gain check (K12 = 16*S/tvar):")
@@ -356,18 +434,55 @@ def analyze_flats(seq, dark):
                 f"  {e0 * 1000:7.2f}->{e1 * 1000:7.2f} ms  ratio {s1 / s0:.3f} "
                 f"(ideal {e1 / e0:.3f})"
             )
+    return flat
+
+
+def emva_extras_core(
+    dk, flat, d_img, f_img, dark_tvar_short, dark_L, flat_tvar_50, flat_L
+):
+    """Saturation/DR/PRNU1288/DSNU1288 numbers (pure, no printing).
+
+    d_img/f_img are the ROI frame-averaged images (Eq. 33) of the
+    shortest-exposure dark and the ~50%-saturation flat; dark_tvar_short and
+    flat_tvar_50 their temporal variances; dark_L/flat_L the frame counts
+    for the Eq. 36 temporal-residual removal. Returns None when no point
+    passes the saturation test.
+    """
+    rows = flat["rows"]
+    ok = [rs for rs in rows if rs[1]["sat_frac"] <= SAT_CLIP_FRAC]
+    fallback = not ok
+    if not ok:
+        ok = [rs for rs in rows if rs[1]["mean"] < CLIP_DN]
+    if not ok:
+        return None
+    mu_sat = max(s["mean"] for _, s in ok)
+    k12 = flat["K12"]
+    bias = dk["bias_dn"]
+    nsat = (mu_sat - bias) * k12 / 16.0
+
+    sig = flat.get("sigma_r_e_q", flat["sigma_r_e"])
+    mu_min = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * sig**2))  # SNR = 1 point
+    dr = nsat / mu_min  # Eq. 28
+
+    s2_dark = max(float(highpass(d_img).var()) - dark_tvar_short / dark_L, 0.0)
+    s2_50 = max(
+        float(highpass(f_img - d_img).var())
+        - flat_tvar_50 / flat_L
+        - dark_tvar_short / dark_L,
+        0.0,
+    )
+    prnu1288 = (
+        100.0 * np.sqrt(max(s2_50 - s2_dark, 0.0)) / (f_img.mean() - d_img.mean())
+    )
     return {
-        "K12": K12,
-        "sigma_r_e": sigma_r_e,
-        "sigma_r_e_q": sigma_r_e_q,
-        "sigma_r_tf_e": sigma_r_tf_e,
-        "sigma_r_tf_e_q": sigma_r_tf_e_q,
-        "Nsat": K12 * 4094,
-        "rows": rows,
-        "bias_dn": dark["bias_dn"],
-        "ptc_slope": K_fit,
-        "ptc_intercept": b,
-        "ptc_r2": ptc_r2,
+        "mu_sat_dn": mu_sat,
+        "nsat_e": nsat,
+        "mu_min_e": mu_min,
+        "dr": dr,
+        "dr_db": float(20 * np.log10(dr)) if dr > 0 else float("nan"),
+        "prnu1288_pct": prnu1288,
+        "dsnu1288_dn": float(np.sqrt(s2_dark)),
+        "sat_fallback": fallback,
     }
 
 
@@ -385,65 +500,69 @@ def emva1288_extras(dark_seq, flat_seq, dk, flat):
     rows = flat["rows"]
     ok = [rs for rs in rows if rs[1]["sat_frac"] <= SAT_CLIP_FRAC]
     if not ok:
-        ok = [rs for rs in rows if rs[1]["mean"] < CLIP_DN]
         print("  ! no point under the clip-fraction limit -- using max unclipped")
-    if not ok:
+    if not ok and not [rs for rs in rows if rs[1]["mean"] < CLIP_DN]:
         print("  ! no usable points")
         return
-    mu_sat = max(s["mean"] for _, s in ok)
-    k12 = flat["K12"]
-    bias = dk["bias_dn"]
-    nsat = (mu_sat - bias) * k12 / 16.0
-    print(
-        f"  mu_y.sat    = {mu_sat:.0f} DN16  (<= {SAT_CLIP_FRAC * 100:.1f}% "
-        f"of pixels at {SAT_MAX_DN:.0f})"
-    )
-    print(
-        f"  Nsat (EMVA) = {nsat:.0f} e-  (bias-subtracted; "
-        f"vs K*4094 = {flat['Nsat']:.0f} e-)"
-    )
-
-    sig = flat.get("sigma_r_e_q", flat["sigma_r_e"])
-    mu_min = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * sig**2))  # SNR = 1 point
-    dr = nsat / mu_min  # Eq. 28
-    print(
-        f"  mu_e.min    = {mu_min:.1f} e- (SNR = 1);  DR = {dr:.0f} (Eq. 28)  "
-        f"({20 * np.log10(dr):.1f} dB)"
-    )
 
     d_stack = min(dark_seq, key=lambda es: es[0])[1]
     dark_tvar = dk["rows"][0][1]["tvar"]
-    target = 0.5 * (mu_sat + bias)
+    mu_sat_max = max(
+        s["mean"] for _, s in (ok or [rs for rs in rows if rs[1]["mean"] < CLIP_DN])
+    )
+    target = 0.5 * (mu_sat_max + dk["bias_dn"])
     idx = min(range(len(rows)), key=lambda i: abs(rows[i][1]["mean"] - target))
     f_exp, f_stack = flat_seq[idx]
     d_img = d_stack[:, ROI[0], ROI[1]].astype(np.float64).mean(axis=0)
     f_img = f_stack[:, ROI[0], ROI[1]].astype(np.float64).mean(axis=0)
 
-    s2_dark = max(
-        float(highpass(d_img).var()) - dark_tvar / d_stack.shape[0], 0.0
-    )  # Eq. 36
-    s2_50 = max(
-        float(highpass(f_img - d_img).var())
-        - rows[idx][1]["tvar"] / f_stack.shape[0]
-        - dark_tvar / d_stack.shape[0],
-        0.0,
+    x = emva_extras_core(
+        dk,
+        flat,
+        d_img=d_img,
+        f_img=f_img,
+        dark_tvar_short=dark_tvar,
+        dark_L=d_stack.shape[0],
+        flat_tvar_50=rows[idx][1]["tvar"],
+        flat_L=f_stack.shape[0],
     )
-    prnu1288 = (
-        100.0 * np.sqrt(max(s2_50 - s2_dark, 0.0)) / (f_img.mean() - d_img.mean())
+    if x is None:
+        return
+    print(
+        f"  mu_y.sat    = {x['mu_sat_dn']:.0f} DN16  "
+        f"(<= {SAT_CLIP_FRAC * 100:.1f}% of pixels at {SAT_MAX_DN:.0f})"
     )
     print(
-        f"  PRNU1288    = {prnu1288:.2f} %  (highpass, {f_exp * 1000:.1f} ms ~ 50% sat)"
+        f"  Nsat (EMVA) = {x['nsat_e']:.0f} e-  (bias-subtracted; "
+        f"vs K*4094 = {flat['Nsat']:.0f} e-)"
     )
-    print(f"  DSNU1288    = {np.sqrt(s2_dark):.2f} DN16 (highpass dark image)")
+    print(
+        f"  mu_e.min    = {x['mu_min_e']:.1f} e- (SNR = 1);  "
+        f"DR = {x['dr']:.0f} (Eq. 28)  ({x['dr_db']:.1f} dB)"
+    )
+    print(
+        f"  PRNU1288    = {x['prnu1288_pct']:.2f} %  "
+        f"(highpass, {f_exp * 1000:.1f} ms ~ 50% sat)"
+    )
+    print(f"  DSNU1288    = {x['dsnu1288_dn']:.2f} DN16 (highpass dark image)")
 
 
-def run(data_dir, roi=None):
+def run(data_dir, roi=None, bands=5):
+    resolved = resolve_data_dir(data_dir)
+    if resolved is None:
+        return
+    cam_dir, layout = resolved
+
+    if layout == "specim":
+        from .band_analyze import run as run_bands  # local: avoid import cycle
+
+        run_bands(cam_dir, roi or DEFAULT_ROI_SPECIM, bands)
+        return
+
     global ROI
+    roi = roi or DEFAULT_ROI
     ROI = tuple(slice(a, b) for a, b in zip(roi[0::2], roi[1::2]))
 
-    cam_dir = resolve_data_dir(data_dir)
-    if cam_dir is None:
-        return
     print(
         f"Analyzing {cam_dir.resolve()}  (ROI rows {roi[0]}:{roi[1]}, "
         f"cols {roi[2]}:{roi[3]})"
@@ -468,6 +587,7 @@ def run(data_dir, roi=None):
             f"(short-exposure median {dk['sigma_r_median_dn']:.2f})"
         )
         save_dark_plot(dk["rows"], out_dir, roi, camera)
+        save_dark_variance_plot(dk["rows"], out_dir, roi, camera)
         flat_seq = load_sequence(cam_dir, "flat")
         flat = analyze_flats(flat_seq, dk)
         if flat:
@@ -491,14 +611,24 @@ def main(argv=None):
     )
     p.add_argument(
         "--roi",
-        default="600:800:850:1050",
-        help="ROI as r0:r1:c0:c1 (default 600:800:850:1050)",
+        default=None,
+        help=f"ROI as r0:r1:c0:c1 (default {':'.join(map(str, DEFAULT_ROI))}; "
+        f"SPECIM IQ {':'.join(map(str, DEFAULT_ROI_SPECIM))})",
+    )
+    p.add_argument(
+        "--bands",
+        type=int,
+        default=5,
+        help="number of equispaced bands in per-band (SPECIM IQ) plots; "
+        "ignored for monochrome npy data (default 5)",
     )
     args = p.parse_args(argv)
-    roi = [int(x) for x in args.roi.split(":")]
-    if len(roi) != 4:
-        p.error("--roi must be r0:r1:c0:c1")
-    run(args.data, roi)
+    roi = None
+    if args.roi is not None:
+        roi = [int(x) for x in args.roi.split(":")]
+        if len(roi) != 4:
+            p.error("--roi must be r0:r1:c0:c1")
+    run(args.data, roi, args.bands)
 
 
 if __name__ == "__main__":

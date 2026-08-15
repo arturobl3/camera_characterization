@@ -9,6 +9,10 @@ Usage examples:
 Camera must be on and connected. Lens cap ON for dark frames; uniform
 illumination (diffuser) for flat frames. Frames are saved under
 <out>/<vendor>_<model>_(<sensor>)/dark|flat (--out defaults to 'data').
+
+analyze also handles SPECIM IQ hyperspectral exports: pass --data pointing
+at the folder holding 'dark frames'/'flat-field frames'; every band is
+analyzed independently (see camchar/band_analyze.py).
 """
 
 import argparse
@@ -227,8 +231,16 @@ def main(argv=None):
     )
     sp.add_argument(
         "--roi",
-        default="600:800:850:1050",
-        help="ROI as r0:r1:c0:c1 (default 600:800:850:1050)",
+        default=None,
+        help="ROI as r0:r1:c0:c1 (default 600:800:850:1050; SPECIM IQ "
+        "hyperspectral data defaults to a central 156:356:156:356)",
+    )
+    sp.add_argument(
+        "--bands",
+        type=int,
+        default=5,
+        help="number of equispaced bands in per-band (SPECIM IQ) plots; "
+        "ignored for monochrome npy data (default 5)",
     )
     sp.set_defaults(_analyze=True)
 
@@ -241,10 +253,12 @@ def main(argv=None):
 
     args = p.parse_args(argv)
     if getattr(args, "_analyze", False):
-        roi = [int(x) for x in args.roi.split(":")]
-        if len(roi) != 4:
-            p.error("--roi must be r0:r1:c0:c1")
-        return analyze_run(args.data, roi)
+        roi = None
+        if args.roi is not None:
+            roi = [int(x) for x in args.roi.split(":")]
+            if len(roi) != 4:
+                p.error("--roi must be r0:r1:c0:c1")
+        return analyze_run(args.data, roi, args.bands)
     if getattr(args, "_warmup", False):
         return _warmup_sensor(args)
     if args.command in ("get-dark-frames", "get-flat-frames"):

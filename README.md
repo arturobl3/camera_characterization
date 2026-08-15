@@ -44,7 +44,7 @@ Sub-ms / fractional-ms exposures use microsecond names (e.g. `flat_004500us`).
 ```
 camchar get-dark-frames [--out ROOT] [--exposures S,S,...] [--frames N] [--gain G] [--notes TXT]
 camchar get-flat-frames [--out ROOT] [--exposures S,S,...] [--frames N] [--gain G] [--notes TXT]
-camchar analyze --data DIR [--roi r0:r1:c0:c1]
+camchar analyze --data DIR [--roi r0:r1:c0:c1] [--bands N]
 camchar warmup-sensor
 ```
 
@@ -63,7 +63,8 @@ quantization-corrected value), dark current (DN/s, from mean and variance),
 N_sat (e⁻), PRNU (%), bias floor, per-point gain check, exposure linearity,
 EMVA-style saturation / absolute sensitivity threshold / dynamic range, and
 highpass-filtered PRNU1288/DSNU1288 (EMVA 1288 §8.1), and writes plots
-(linearity, PTC, SNR) to `outputs/<vendor>_<model>_(<sensor>)/`. ROI defaults
+(dark mean + dark variance vs exposure, linearity, PTC, SNR) to
+`outputs/<vendor>_<model>_(<sensor>)/`. ROI defaults
 to a central 200×200 patch (600:800:850:1050); only the ROI needs uniform
 illumination.
 Every quantity is cross-checked with the **EMVA 1288 Release 4 two-frame method**
@@ -75,6 +76,46 @@ variance uses ddof=1 (EMVA R4 Linear Eq. 65): the ddof=0 population estimator is
 low by (N−1)/N (5% at N=20) — this exact bug was caught by the two-frame
 cross-check in the Aug 2026 Apollo-M dataset (K 8.91 → 8.46 e⁻/DN12).
 
+## SPECIM IQ hyperspectral (per-band analysis)
+
+`analyze` also handles SPECIM IQ exports. Point `--data` at the folder
+holding the camera's `dark frames/` and `flat-field frames/` directories
+(`data/SPECIM_IQ` here); with several cameras under one root, pass the
+camera dir explicitly:
+
+```bash
+uv run camchar analyze --data data/SPECIM_IQ            # all 204 bands
+uv run camchar analyze --data data/SPECIM_IQ --bands 7  # 7 curves per plot
+```
+
+- **Layout**: `<root>/<kind>/<N> ms>/<ID>/capture/<ID>.hdr|.raw` (ENVI, BIL,
+  uint16, 512×512×204, 397–1004 nm). Exposure time comes from the `<N> ms`
+  folder name, cross-checked against the header `tint`. The per-capture
+  `DARKREF_*`/`WHITEREF_*`/`WHITEDARKREF_*` files are the camera's stored
+  512×1×204 calibration slabs and are deliberately ignored — temporal
+  statistics need the raw cubes.
+- **DN scaling**: raw 12-bit DN is shifted `<<4` into DN16, so every
+  constant and formula of the monochrome pipeline (clip 65400, saturation
+  65504, quantization step 16, K12 = 16/K_fit) applies unchanged.
+- **Per-band analysis**: every band is analyzed as an independent
+  monochrome camera with the same EMVA R4 Linear math (same estimators,
+  ddof conventions, two-frame cross-checks). PTC-fit points must pass the
+  EMVA §6.6 saturation test (≤0.2% clipped pixels) — not just the mean
+  clip threshold, since heavily pinned pixels lose their variance and bend
+  the fit. Bands with <3 usable flat points (dim UV end, saturated bands)
+  are `skipped`; bands whose V-vs-S slope comes out non-positive
+  (between-acquisition drift is the usual cause — each acquisition is a
+  separate recording) are flagged `degenerate PTC` and their two-frame K is
+  the robust estimate.
+- **Output**: one-line-per-band table, an EMVA detail block per plotted
+  band, `outputs/SPECIM_IQ/band_parameters.csv` (every parameter × 204
+  bands), the same plot set as the monochrome path with one curve per
+  selected band (`--bands`, default 5, equispaced), plus a
+  parameters-vs-wavelength summary figure (K, σr, dark current,
+  PRNU/DSNU1288).
+- ROI defaults to the central 200×200 (156:356:156:356) of the 512×512
+  frame; `--roi` overrides.
+
 ## Project layout
 
 ```
@@ -82,6 +123,9 @@ camera_characterization/
 ├── camchar/
 │   ├── cli.py                 # argparse CLI (get-dark-frames | get-flat-frames | analyze)
 │   ├── analyze.py             # temporal PTC analysis (K, σr, Nsat, PRNU, linearity)
+│   ├── band_analyze.py        # per-band EMVA analysis for hyperspectral data
+│   ├── specim.py              # SPECIM IQ ENVI discovery/loading (12-bit -> DN16)
+│   ├── plots.py               # matplotlib figures (Agg), monochrome + per-band
 │   ├── io_utils.py            # npy + metadata.json saving, stem_for() naming
 │   └── backends/
 │       ├── base.py            # CameraBackend ABC
@@ -93,11 +137,15 @@ camera_characterization/
 │       └── py/                # vendored pyPOACamera.py (platform-aware loading)
 ├── pyproject.toml             # uv-managed: uv sync, uv run camchar ...
 ├── data/                      # acquired sequences (gitignored)
-│   └── playerone_Apollo-M_(IMX174)/
-│       ├── dark/              # .npy stacks + metadata.json
-│       └── flat/
+│   ├── playerone_Apollo-M_(IMX174)/
+│   │   ├── dark/              # .npy stacks + metadata.json
+│   │   └── flat/
+│   └── SPECIM_IQ/             # hyperspectral export (gitignored, ~48 GB)
+│       ├── dark frames/<N> ms/<ID>/capture/
+│       └── flat-field frames/<N> ms/<ID>/capture/
 └── outputs/                   # plots per camera (gitignored)
-    └── playerone_Apollo-M_(IMX174)/
+    ├── playerone_Apollo-M_(IMX174)/
+    └── SPECIM_IQ/             # + band_parameters.csv
 ```
 
 Add a vendor: implement `CameraBackend` in `camchar/backends/<vendor>.py`, decorate
