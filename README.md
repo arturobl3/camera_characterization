@@ -14,13 +14,13 @@ brew install libusb
 uv sync                      # creates .venv, installs camchar + numpy (uv.lock)
 
 # warm up to steady-state operating temperature (auto-stops once stable)
-uv run camchar warmup-sensor
+uv run camchar warmup-sensor --vendor playerone
 
 # dark frames: lens cap ON, dark room
-uv run camchar get-dark-frames \
+uv run camchar get-dark-frames --vendor playerone \
     --exposures 1,10,100,500,2000 --frames 20 --gain 0
 # flat frames: uniform broadband illumination (halogen + diffuser, or LED flat panel)
-uv run camchar get-flat-frames \
+uv run camchar get-flat-frames --vendor playerone \
     --exposures 10,50,100,500 --frames 20 --gain 0 \
     --notes "green LED ~530nm, diffuser, 30 cm"
 
@@ -30,9 +30,9 @@ uv run camchar analyze --data data
 
 `python -m camchar ...` also works (same package). The console script and
 module are interchangeable; on Windows lab machines run the same commands from
-a `uv sync`'d checkout. Select the camera vendor with `--vendor basler`
-(default `playerone`); Basler `--gain` is in dB (float, 0–24), Player One gain
-is an integer.
+a `uv sync`'d checkout. `--vendor` (playerone | basler) is **required** on the
+four acquisition commands (`analyze` is offline and takes none); Basler
+`--gain` is in dB (float, 0–24), Player One gain is an integer.
 
 Acquired sequences are organized per camera:
 `<data root>/<vendor>_<model>_(<sensor>)/{dark,flat}/` (default root `data`,
@@ -45,11 +45,11 @@ Sub-ms / fractional-ms exposures use microsecond names (e.g. `flat_004500us`).
 ## CLI
 
 ```
-camchar get-dark-frames [--out ROOT] [--exposures MS,MS,...] [--frames N] [--gain G] [--notes TXT]
-camchar get-flat-frames [--out ROOT] [--exposures MS,MS,...] [--frames N] [--gain G] [--notes TXT]
+camchar get-dark-frames --vendor playerone [--out ROOT] [--exposures MS,MS,...] [--frames N] [--gain G] [--notes TXT]
+camchar get-flat-frames --vendor playerone [--out ROOT] [--exposures MS,MS,...] [--frames N] [--gain G] [--notes TXT]
 camchar analyze --data DIR [--roi r0:r1:c0:c1] [--bands N]
-camchar warmup-sensor
-camchar source-stability-check [--exposures MS,MS,...] [--frames N] [--gain G]
+camchar warmup-sensor --vendor basler
+camchar source-stability-check --vendor basler [--exposures MS,MS,...] [--frames N] [--gain G]
 ```
 
 Exposure times are given in milliseconds (fractional values allowed). Defaults: dark

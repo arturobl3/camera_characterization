@@ -4,10 +4,10 @@
 
 - Setup: `uv sync` (Python >=3.11; creates `.venv`)
 - Run: `uv run camchar ...` or `uv run python -m camchar ...` (equivalent)
-- The CLI is a **typer** app (`camchar/cli.py`): rich, colored help and output (colors auto-disable when piped). Helpers in cli.py take explicit kwargs — no argparse Namespace. Exit codes are raised via `typer.Exit` (warmup 130 on Ctrl+C/1 on abort; stability check 1 when unstable).
+- The CLI is a **typer** app (`camchar/cli.py`): rich, colored help and output (colors auto-disable when piped). Helpers in cli.py take explicit kwargs — no argparse Namespace. Exit codes are raised via `typer.Exit` (warmup 130 on Ctrl+C/1 on abort; stability check 1 when unstable). `--vendor` (playerone | basler) is a required option on the four acquisition commands; `analyze` is offline and has none.
 - Verify without hardware: `uv run camchar --help`; `uv run camchar analyze --data data`
 - Lint: `uv run ruff check .` — Format: `uv run ruff format .` (ruff is a dev dependency; `vendor/` is excluded — never lint/format the vendored SDK wrapper)
-- No test suite or typecheck is configured. Don't guess one into existence.
+- Test: `uv run pytest` (pytest is a dev dependency; `[tool.pytest.ini_options]` in pyproject.toml, `testpaths = ["tests"]`). Tests fall into two groups: CLI exit-code tests with mocked backends (`tests/test_cli.py`, Typer CliRunner — exit 1 unstable, 0 stable, 130 Ctrl+C, 1 abort, 2 bad exposures/missing vendor) and pure-function unit tests (`tests/test_analyze.py`, `tests/test_io_utils.py`) that lock in the EMVA fit semantics (Eq. 50 zero-intercept K, dV>0 selection, 70%-of-mu_sat cap, dark-variance extrapolation, degenerate-guard None) and the filename/metadata conventions (stem_for round-trip, camera_dir_name). No typecheck is configured. Don't add other test frameworks.
 
 ## Hardware dependence
 
@@ -25,7 +25,7 @@
 
 ## Basler backend (pypylon) — conventions
 
-- `camchar/backends/basler.py` drives Basler cameras via pypylon (wheel bundles the pylon runtime; if enumeration fails, the pylon Software Suite USB3 driver is missing). `--vendor basler` selects it; `--gain` is float dB (Player One keeps its int coercion).
+- `camchar/backends/basler.py` drives Basler cameras via pypylon (wheel bundles the pylon runtime; if enumeration fails, the pylon Software Suite USB3 driver is missing). `--vendor basler` (required) selects it; `--gain` is float dB (Player One keeps its int coercion).
 - Grabs `PixelFormat Mono12` (unpacked) with a per-frame software trigger (`TriggerMode=FrameStart/Software`): free-run buffers would be stale after an exposure change. Frames are `<<4` to DN16 at the backend, matching the playerone path so analyze.py constants/fits are shared. `configure()` loads the camera's Default user set first so pylon Viewer leftovers (test pattern, ROI, LUT) never leak in. Gain via the `Gain` node (dB); temp via `DeviceTemperature` (NaN fallback). Exposures below/above the camera range (min 21 µs on acA1920-155um) are clamped in `snap()` with a warning, and the effective exposure is exposed as `last_exposure_s` (cli records it in metadata/filenames). `close()` is a real close (StopGrabbing + Close) — no wedging like playerone macOS.
 - **`configure()` also forces `GainAuto`/`ExposureAuto`/`BlackLevelAuto` = Off and sets a digital black level** so dark frames don't underflow — without it the IMX174's default keeps the read-noise distribution pinned at 0 (97 % of dark pixels at exactly zero, Aug 2026), which censors the dark histogram and destroys σr, σ²dark, and low-signal PTC points. The `BlackLevel` node is 5.4 fixed-point (range 0..31.9375 ≈ 0..511 DN12, i.e. ~16 DN12/unit on the IMX174 — verified: node 31.9375 → 8,160 DN16 dark mean); the DN12 target is `_BLACK_LEVEL_DN12 = 8` (≈ 128 DN16 mean). The resulting mean dark offset must stay < 0.5 % of pixels at zero (EMVA) and is recorded as `black_level_dn12` in metadata.
 - **CLI `--exposures` is in milliseconds** (`_parse_exposures_ms`), seconds were the pre-typer convention: `0.001` means 1 µs (clamped to the 21 µs minimum!) — use ms values like `1,10,100`, and note that sub-minimum exposures that clamp to the same effective exposure collide to one filename (silent overwrite).

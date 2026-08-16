@@ -219,15 +219,15 @@ class BaslerBackend(CameraBackend):
         node = self._node(cam, "BlackLevel")
         info = self._info or {}
         if node is None:
-            print("  [basler] WARNING: no BlackLevel node — dark frames may "
-                  "underflow; set an offset in pylon Viewer and save 'Default'")
+            print(
+                "  [basler] WARNING: no BlackLevel node — dark frames may "
+                "underflow; set an offset in pylon Viewer and save 'Default'"
+            )
             info["black_level_dn12"] = None
             return
         try:
             lo, hi = float(node.GetMin()), float(node.GetMax())
-            value = min(
-                max(float(target_dn12) / _DN12_PER_BLACKLEVEL_UNIT, lo), hi
-            )
+            value = min(max(float(target_dn12) / _DN12_PER_BLACKLEVEL_UNIT, lo), hi)
             node.SetValue(value)
             # Analog_All is the mono selector on ace models; 'Analog' is a
             # fallback found on some others. Doesn't hurt to try both.
@@ -251,8 +251,10 @@ class BaslerBackend(CameraBackend):
             )
         except Exception as exc:
             info["black_level_dn12"] = None
-            print(f"  [basler] WARNING: failed to set BlackLevel ({exc}); "
-                  "dark frames may underflow")
+            print(
+                f"  [basler] WARNING: failed to set BlackLevel ({exc}); "
+                "dark frames may underflow"
+            )
 
     def sensor_temp_c(self):
         try:

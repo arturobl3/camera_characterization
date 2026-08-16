@@ -1,15 +1,17 @@
 """CLI entry point (Typer).
 
 Usage examples:
-  python -m camchar get-dark-frames --exposures 100,500,1000,2000 --frames 20 --gain 0
-  python -m camchar get-flat-frames --exposures 10,50,100 --frames 20 \\
+  python -m camchar get-dark-frames --vendor playerone --exposures 100,500,1000,2000 --frames 20 --gain 0
+  python -m camchar get-flat-frames --vendor playerone --exposures 10,50,100 --frames 20 \\
       --gain 0 --notes "green LED ~530nm, 30cm"
-  python -m camchar warmup-sensor
-  python -m camchar source-stability-check
+  python -m camchar warmup-sensor --vendor basler
+  python -m camchar source-stability-check --vendor basler
 
-Camera must be on and connected. Lens cap ON for dark frames; uniform
-illumination (diffuser) for flat frames. Frames are saved under
-<out>/<vendor>_<model>_(<sensor>)/dark|flat (--out defaults to 'data').
+--vendor (playerone | basler) is required on every acquisition command;
+analyze is offline and needs no vendor. Camera must be on and connected.
+Lens cap ON for dark frames; uniform illumination (diffuser) for flat
+frames. Frames are saved under <out>/<vendor>_<model>_(<sensor>)/dark|flat
+(--out defaults to 'data').
 
 analyze also handles SPECIM IQ hyperspectral exports: pass --data pointing
 at the folder holding 'dark frames'/'flat-field frames'; every band is
@@ -68,12 +70,8 @@ def _ms_list(exposures_ms):
     return ", ".join(f"{e:g} ms" for e in exposures_ms)
 
 
-@app.callback()
-def _set_vendor(
-    ctx: typer.Context,
-    vendor: str = typer.Option("playerone", help="camera vendor backend"),
-) -> None:
-    ctx.obj = {"vendor": vendor}
+def _vendor_option():
+    return typer.Option(..., help="camera vendor backend (playerone | basler)")
 
 
 def _run_sequence(vendor, out, exposures_ms, frames, gain, notes, seq_type):
@@ -330,7 +328,7 @@ def _source_stability_check(vendor, exposures_ms, frames, gain):
 
 @app.command()
 def get_dark_frames(
-    ctx: typer.Context,
+    vendor: str = _vendor_option(),
     out: Path = typer.Option(
         "data",
         help="root output directory; frames go to "
@@ -351,12 +349,12 @@ def get_dark_frames(
     notes: str = typer.Option("dark", help="metadata notes, e.g. 'lens cap on'"),
 ):
     """Acquire dark frames (lens cap ON, dark room)."""
-    _run_sequence(ctx.obj["vendor"], out, exposures, frames, gain, notes, "dark")
+    _run_sequence(vendor, out, exposures, frames, gain, notes, "dark")
 
 
 @app.command()
 def get_flat_frames(
-    ctx: typer.Context,
+    vendor: str = _vendor_option(),
     out: Path = typer.Option(
         "data",
         help="root output directory; frames go to "
@@ -377,7 +375,7 @@ def get_flat_frames(
     notes: str = typer.Option("flat", help="metadata notes, e.g. 'green LED ~530nm'"),
 ):
     """Acquire flat frames (uniform broadband illumination)."""
-    _run_sequence(ctx.obj["vendor"], out, exposures, frames, gain, notes, "flat")
+    _run_sequence(vendor, out, exposures, frames, gain, notes, "flat")
 
 
 @app.command()
@@ -408,16 +406,16 @@ def analyze(
 
 
 @app.command()
-def warmup_sensor(ctx: typer.Context):
+def warmup_sensor(vendor: str = _vendor_option()):
     """Run the camera to warm it up to its steady-state operating temperature."""
-    rc = _warmup_sensor(ctx.obj["vendor"])
+    rc = _warmup_sensor(vendor)
     if rc:
         raise typer.Exit(rc)
 
 
 @app.command()
 def source_stability_check(
-    ctx: typer.Context,
+    vendor: str = _vendor_option(),
     exposures: str = typer.Option(
         ",".join(map(str, SOURCE_STABILITY_EXPOSURES_MS)),
         parser=_parse_exposures_ms,
@@ -434,7 +432,7 @@ def source_stability_check(
     ),
 ):
     """Check the light-source stability for flat-field measurements."""
-    rc = _source_stability_check(ctx.obj["vendor"], exposures, frames, gain)
+    rc = _source_stability_check(vendor, exposures, frames, gain)
     if rc:
         raise typer.Exit(rc)
 
