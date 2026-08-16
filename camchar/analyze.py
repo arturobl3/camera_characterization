@@ -302,10 +302,13 @@ def analyze_dark(seq):
 def fit_flat_stats(rows, dark):
     """PTC fit and derived quantities from roi_stats rows (pure).
 
-    Fits V = K_fit*S + b on (mean, tvar) of the usable rows and derives
-    K12 = 16/K_fit, electron-unit read noises (Eq. 53 quantization-corrected
-    variants included) and the quick upper-bound PRNU estimates. Returns
-    None when fewer than 3 unclipped points are available.
+    Fits V = K_fit*S + b on (tvar, mean) of the usable rows with the EMVA
+    abscissa S = mean - bias_dn (the photo-induced signal, so the intercept
+    is the read-noise variance offset and cross-checks the Eq. 30 dark
+    sigma_r^2), and derives K12 = 16/K_fit, electron-unit read noises
+    (Eq. 53 quantization-corrected variants included) and the quick
+    upper-bound PRNU estimates. Returns None when fewer than 3 unclipped
+    points are available.
 
     Usable = mean < CLIP_DN *and* sat_frac <= SAT_CLIP_FRAC (EMVA 6.6):
     heavily-pinned points can sit below the mean threshold while their
@@ -315,7 +318,8 @@ def fit_flat_stats(rows, dark):
     measured saturation point, i.e. the largest mean passing the 6.6 test),
     so points above PTC_FIT_SAT_FRAC * mu_sat are excluded; when the data
     never reaches saturation (fewer than 3 points under the cap) all points
-    are kept.
+    are kept. The cap itself stays in raw-DN units; only the fit abscissa
+    is bias-subtracted.
     """
     ok = [s for _, s in rows if s["mean"] < CLIP_DN and s["sat_frac"] <= SAT_CLIP_FRAC]
     if len(ok) < 3:
@@ -326,7 +330,7 @@ def fit_flat_stats(rows, dark):
     if len(ok_fit) < 3:
         ok_fit = ok  # never reached saturation: keep all linear points
     capped = len(ok_fit) < len(ok)
-    S = np.array([s["mean"] for s in ok_fit])
+    S = np.array([s["mean"] - dark["bias_dn"] for s in ok_fit])
     V = np.array([s["tvar"] for s in ok_fit])
     K_fit, b = np.polyfit(S, V, 1)
     V_hat = np.polyval([K_fit, b], S)
@@ -447,15 +451,16 @@ def analyze_flats(seq, dark):
             f"covariance, DSNU-subtracted)"
         )
     typer.secho(
-        "\n  per-point gain check (K12 = 16*S/tvar):",
+        "\n  per-point gain check (K12 = 16*S/tvar, S = mu_y - mu_y,dark):",
         bold=True,
         fg=typer.colors.CYAN,
     )
+    bias = dark["bias_dn"]
     for exp_s, s in rows:
         if s["mean"] < CLIP_DN:
             typer.echo(
-                f"    {exp_s * 1000:7.2f} ms  S={s['mean']:9.1f}  "
-                f"K12={16 * s['mean'] / s['tvar']:6.2f} e-/DN12"
+                f"    {exp_s * 1000:7.2f} ms  S={s['mean'] - bias:9.1f}  "
+                f"K12={16 * (s['mean'] - bias) / s['tvar']:6.2f} e-/DN12"
             )
     # linearity vs exposure
     typer.secho(
@@ -600,6 +605,37 @@ def emva1288_extras(dark_seq, flat_seq, dk, flat):
         f"(highpass, {f_exp * 1000:.1f} ms ~ 50% sat)"
     )
     typer.echo(f"  DSNU1288    = {x['dsnu1288_dn']:.2f} DN16 (highpass dark image)")
+    return x
+
+
+def snr_total_model(extras, signal_e, sigma_d_e, k12):
+    """EMVA R4 Linear Eq. 69: total-SNR model curve vs mean signal (e-, pure).
+
+    Adds the spatial nonuniformities (DSNU1288 in e- = DN16*K12/16, Eq. 66,
+    and PRNU1288 as a fraction, Eq. 67) and the quantization noise
+    sigma_q^2/K^2 to the temporal terms. sigma_d_e is the dark temporal
+    noise in e- (the Eq. 53 quant-corrected read noise, so quantization is
+    not double-counted); signal_e is the mean photo signal in e-.
+    """
+    dsnu_e = extras["dsnu1288_dn"] * k12 / 16.0
+    prnu = extras["prnu1288_pct"] / 100.0
+    q2_e = (QUANT_STEP_DN16**2 / 12.0) * (k12 / 16.0) ** 2
+    var = sigma_d_e**2 + dsnu_e**2 + q2_e + signal_e + (prnu * signal_e) ** 2
+    return signal_e / np.sqrt(var)
+
+
+def snr_total_measured(extras, means, bias_dn, tvars, k12):
+    """Measured total SNR (e-, pure) per exposure step.
+
+    Temporal variance tvar plus the spatial nonuniformity variance
+    s_y^2 = DSNU1288^2 + PRNU1288^2*(mu - mu.dark)^2 (Eq. 68), converted to
+    e- with the gain; tvar already includes the quantization noise.
+    """
+    dsnu2 = extras["dsnu1288_dn"] ** 2
+    prnu = extras["prnu1288_pct"] / 100.0
+    s2 = dsnu2 + (prnu * (means - bias_dn)) ** 2
+    signal_e = (means - bias_dn) * k12 / 16.0
+    return signal_e / np.sqrt((tvars + s2) * (k12 / 16.0) ** 2)
 
 
 def run(data_dir, roi=None, bands=5):
@@ -651,7 +687,7 @@ def run(data_dir, roi=None, bands=5):
         flat_seq = load_sequence(cam_dir, "flat")
         flat = analyze_flats(flat_seq, dk)
         if flat:
-            emva1288_extras(dark_seq, flat_seq, dk, flat)
+            flat["extras"] = emva1288_extras(dark_seq, flat_seq, dk, flat)
             save_linearity_plot(
                 flat["rows"], flat["bias_dn"], out_dir, CLIP_DN, roi, camera
             )

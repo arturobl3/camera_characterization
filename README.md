@@ -72,7 +72,8 @@ quantization-corrected value), dark current (DN/s, from mean and variance),
 N_sat (e⁻), PRNU (%), bias floor, per-point gain check, exposure linearity,
 EMVA-style saturation / absolute sensitivity threshold / dynamic range, and
 highpass-filtered PRNU1288/DSNU1288 (EMVA 1288 §8.1), and writes plots
-(dark mean + dark variance vs exposure, linearity, PTC, SNR) to
+(dark mean + dark variance vs exposure, linearity, PTC, SNR; the SNR plot adds the
+EMVA Eq. 69 total-SNR curve and measured points including DSNU1288/PRNU1288) to
 `outputs/<vendor>_<model>_(<sensor>)/`. ROI defaults
 to a central 400×400 patch (500:900:750:1150); only the ROI needs uniform
 illumination.

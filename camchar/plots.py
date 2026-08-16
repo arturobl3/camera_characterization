@@ -249,22 +249,25 @@ def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
 
 
 def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
-    """Log-log photon transfer curve (temporal variance vs mean signal).
+    """Log-log photon transfer curve (temporal variance vs photo-induced signal).
 
-    flat/dark are the return dicts from analyze_flats/analyze_dark. Unclipped
-    flat points carry the shot-noise fit line V = K_fit*S + b; dark points show
-    the read-noise region with a dashed floor at sigma_r^2. Saturated points
-    are excluded (their variance is degenerate). Saves
+    flat/dark are the return dicts from analyze_flats/analyze_dark. The
+    abscissa is the EMVA photo-induced signal mu_y - mu_y,dark (the fit is
+    V = K_fit*S + b with S = mean - bias_dn, so the intercept is the
+    read-noise variance offset); dark points sit at the left edge (x=0,
+    clamped to 1 DN16 for the log axis) with a dashed floor at sigma_r^2.
+    Saturated points are excluded (their variance is degenerate). Saves
     ptc_variance_vs_mean.png.
     """
+    bias = flat["bias_dn"]
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    dx = np.array([s["mean"] for _, s in dark["rows"]])
+    dx = np.array([s["mean"] - bias for _, s in dark["rows"]])
     dv = np.array([s["tvar"] for _, s in dark["rows"]])
     m = dv > 0
     if m.any():
         ax.loglog(
-            dx[m],
+            np.maximum(dx[m], 1.0),
             dv[m],
             "^",
             color="tab:green",
@@ -280,11 +283,13 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
         typer.secho("  ! too few points for PTC plot", fg=typer.colors.YELLOW)
         plt.close(fig)
         return None
-    ax.loglog(fx[fit_mask], fv[fit_mask], "o", ms=5, label="flat (fit, 0-70% sat)")
+    ax.loglog(
+        fx[fit_mask] - bias, fv[fit_mask], "o", ms=5, label="flat (fit, 0-70% sat)"
+    )
     above = (fx > cap) & (fx < clip_dn) & (fv > 0)
     if above.any():
         ax.loglog(
-            fx[above],
+            fx[above] - bias,
             fv[above],
             "x",
             ms=6,
@@ -293,7 +298,7 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
             label="excluded (>70% sat)",
         )
 
-    x_line = np.linspace(fx[fit_mask].min(), fx[fit_mask].max(), 200)
+    x_line = np.linspace(fx[fit_mask].min(), fx[fit_mask].max(), 200) - bias
     ax.loglog(
         x_line,
         np.polyval([flat["ptc_slope"], flat["ptc_intercept"]], x_line),
@@ -311,7 +316,7 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
         label=rf"$\sigma_r^2$ read-noise floor = {sigma_r2:.1f} DN16²",
     )
     ax.axvline(
-        2**16,
+        2**16 - bias,
         ls="--",
         color="tab:red",
         lw=1.2,
@@ -319,18 +324,20 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
     )
     if flat["ptc_capped"]:
         ax.axvline(
-            cap,
+            cap - bias,
             ls="--",
             color="tab:orange",
             lw=1.2,
             label=rf"0.7·$\mu_{{s}}$ = {cap:.0f} DN16",
         )
 
-    ax.set_xlabel(r"$\mu_y$ (DN16)")
+    ax.set_xlabel(r"$\mu_y - \mu_{y,\mathrm{dark}}$ (DN16)")
     ax.set_ylabel(r"$\sigma_y^2$ (DN16²)")
     ax.set_title(
         _title_with_camera(
-            r"Photon transfer curve: $\sigma_y^2$ vs $\mu_y$", camera, roi
+            r"Photon transfer curve: $\sigma_y^2$ vs $\mu_y - \mu_{y,\mathrm{dark}}$",
+            camera,
+            roi,
         )
     )
     ax.legend(loc="lower right")
@@ -339,7 +346,8 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
     ax.text(
         0.03,
         0.97,
-        rf"$\sigma_y^2 = {flat['ptc_slope']:.4g}\,\mu_y {flat['ptc_intercept']:+.1f}$"
+        rf"$\sigma_y^2 = {flat['ptc_slope']:.4g}\,(\mu_y - "
+        rf"\mu_{{y,\mathrm{{dark}}}}) {flat['ptc_intercept']:+.1f}$"
         " (DN16²)"
         "\n"
         f"R² = {flat['ptc_r2']:.6f}"
@@ -369,8 +377,14 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
     bias-subtracted via K12; measured SNR comes from each point's temporal
     variance (EMVA 1288 R4 Linear Eq. 20). Overlays the fitted noise model
     (shot noise sigma_e^2 = mu_e, Eq. 13, + read noise) and the ideal-camera
-    limit SNR = sqrt(S_e) (Eq. 23). Saves snr_vs_signal.png.
+    limit SNR = sqrt(S_e) (Eq. 23). When flat carries the EMVA extras
+    (flat['extras']), also draws the Eq. 69 total SNR (DSNU1288 + PRNU1288 +
+    quantization included): the model curve plus the measured total SNR at
+    each exposure step. Saves snr_vs_signal.png.
     """
+    from .analyze import snr_total_measured, snr_total_model  # local: import cycle
+
+    extras = flat.get("extras")
     means = np.array([s["mean"] for _, s in flat["rows"]])
     tvars = np.array([s["tvar"] for _, s in flat["rows"]])
     m = (means < clip_dn) & (tvars > 0)
@@ -382,7 +396,7 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
     snr = (means[m] - flat["bias_dn"]) / np.sqrt(tvars[m])
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.loglog(signal, snr, "o", ms=5, label="measured (flat)")
+    ax.loglog(signal, snr, "+", ms=7, label="measured (flat)")
     s_curve = np.linspace(signal.min(), signal.max(), 200)
     ax.loglog(
         s_curve,
@@ -399,20 +413,53 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
         color="0.4",
         label=r"ideal camera: $\sqrt{\mu_e}$",
     )
+    if extras:
+        ax.loglog(
+            signal,
+            snr_total_measured(extras, means[m], flat["bias_dn"], tvars[m], k12),
+            "x",
+            ms=6,
+            color="tab:purple",
+            label="measured total SNR (Eq. 69)",
+        )
+        ax.loglog(
+            s_curve,
+            snr_total_model(extras, s_curve, flat["sigma_r_e_q"], k12),
+            "-.",
+            lw=1.5,
+            color="tab:purple",
+            label=r"total SNR model: $\mu_e/\sqrt{\sigma_d^2+\mathrm{DSNU}^2+"
+            r"\sigma_q^2/K^2+\mu_e+\mathrm{PRNU}^2\mu_e^2}$",
+        )
+    else:
+        typer.secho(
+            "  ! no EMVA extras -- Eq. 69 total SNR omitted",
+            fg=typer.colors.YELLOW,
+        )
     ax.set_xlabel(r"$\mu_e$ (e⁻)")
     ax.set_ylabel("SNR")
     ax.set_title(_title_with_camera(r"SNR vs $\mu_e$", camera, roi))
-    ax.legend(loc="lower right")
+    ax.legend(loc="lower right", fontsize=9)
     ax.grid(alpha=0.3)
     ax.grid(which="minor", ls="--", alpha=0.3)
-    ax.text(
-        0.03,
-        0.97,
+    text = (
         f"K = {k12:.2f} e⁻/DN12"
         "\n"
         rf"$\sigma_r$ = {flat['sigma_r_e']:.2f} e⁻"
         "\n"
-        rf"$\mu_{{e,\mathrm{{sat}}}}$ = {flat['Nsat']:.0f} e⁻",
+        rf"$\mu_{{e,\mathrm{{sat}}}}$ = {flat['Nsat']:.0f} e⁻"
+    )
+    if extras:
+        text += (
+            "\n"
+            rf"DSNU1288 = {extras['dsnu1288_dn'] * k12 / 16.0:.2f} e⁻"
+            "\n"
+            f"PRNU1288 = {extras['prnu1288_pct']:.2f} %"
+        )
+    ax.text(
+        0.03,
+        0.97,
+        text,
         transform=ax.transAxes,
         va="top",
         fontsize=10,
@@ -605,7 +652,8 @@ def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=No
 def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
     """Log-log photon transfer curve with one curve + fit per band.
 
-    Saves ptc_variance_vs_mean_bands.png.
+    Abscissa is the photo-induced signal mu_y - mu_y,dark (the per-band fit
+    is on S = mean - bias_dn). Saves ptc_variance_vs_mean_bands.png.
     """
     fig, ax = plt.subplots(figsize=(8, 5))
     drew = False
@@ -613,6 +661,7 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         f = r["flat"]
         if not f:
             continue
+        bias = f["bias_dn"]
         x = np.array([s["mean"] for _, s in f["rows"]])
         v = np.array([s["tvar"] for _, s in f["rows"]])
         cap = f["ptc_sat_70_dn"]
@@ -620,7 +669,7 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         if m.sum() < 2:
             continue
         ax.loglog(
-            x[m],
+            x[m] - bias,
             v[m],
             "o",
             ms=4,
@@ -629,8 +678,8 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         )
         ab = (x > cap) & (x < clip_dn) & (v > 0)
         if ab.any():
-            ax.loglog(x[ab], v[ab], "x", ms=4, color="0.5", alpha=0.7)
-        xl = np.linspace(x[m].min(), x[m].max(), 100)
+            ax.loglog(x[ab] - bias, v[ab], "x", ms=4, color="0.5", alpha=0.7)
+        xl = np.linspace(x[m].min(), x[m].max(), 100) - bias
         ax.loglog(
             xl,
             np.polyval([f["ptc_slope"], f["ptc_intercept"]], xl),
@@ -643,11 +692,12 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         typer.secho("  ! too few points for per-band PTC plot", fg=typer.colors.YELLOW)
         plt.close(fig)
         return None
-    ax.set_xlabel(r"$\mu_y$ (DN16)")
+    ax.set_xlabel(r"$\mu_y - \mu_{y,\mathrm{dark}}$ (DN16)")
     ax.set_ylabel(r"$\sigma_y^2$ (DN16²)")
     ax.set_title(
         _title_with_camera(
-            r"Photon transfer curve: $\sigma_y^2$ vs $\mu_y$ (per band)",
+            r"Photon transfer curve: $\sigma_y^2$ vs "
+            r"$\mu_y - \mu_{y,\mathrm{dark}}$ (per band)",
             camera,
             roi,
         )
@@ -668,15 +718,21 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
     """SNR vs signal (e-) with one measured curve + model per band.
 
     Also draws the ideal-camera limit SNR = sqrt(mu_e) (dashed) across the
-    combined signal range of all bands. Saves snr_vs_signal_bands.png.
+    combined signal range of all bands, and per band the Eq. 69 total SNR
+    (model curve + measured points, from the band's EMVA extras). Saves
+    snr_vs_signal_bands.png.
     """
+    from .analyze import snr_total_measured, snr_total_model  # local: import cycle
+
     fig, ax = plt.subplots(figsize=(8, 5))
     drew = False
+    drew_total = False
     sig_lo, sig_hi = [], []
     for color, r in zip(_band_colors(len(sel_results)), sel_results):
         f = r["flat"]
         if not f or not r["dark_rows"]:
             continue
+        extras = r.get("extras")
         means = np.array([s["mean"] for _, s in f["rows"]])
         tvars = np.array([s["tvar"] for _, s in f["rows"]])
         m = (means < clip_dn) & (tvars > 0)
@@ -685,10 +741,28 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         signal = (means[m] - f["bias_dn"]) * f["K12"] / 16.0
         snr = (means[m] - f["bias_dn"]) / np.sqrt(tvars[m])
         ax.loglog(
-            signal, snr, "o", ms=4, color=color, label=rf"$\lambda$ {r['wl_nm']:.0f} nm"
+            signal, snr, "+", ms=6, color=color, label=rf"$\lambda$ {r['wl_nm']:.0f} nm"
         )
         sc = np.linspace(signal.min(), signal.max(), 100)
         ax.loglog(sc, sc / np.sqrt(sc + f["sigma_r_e"] ** 2), "-", lw=1.2, color=color)
+        if extras:
+            ax.loglog(
+                signal,
+                snr_total_measured(extras, means[m], f["bias_dn"], tvars[m], f["K12"]),
+                "x",
+                ms=5,
+                color=color,
+                alpha=0.7,
+            )
+            ax.loglog(
+                sc,
+                snr_total_model(extras, sc, f["sigma_r_e_q"], f["K12"]),
+                "-.",
+                lw=1.2,
+                color=color,
+                alpha=0.9,
+            )
+            drew_total = True
         sig_lo.append(signal.min())
         sig_hi.append(signal.max())
         drew = True
@@ -705,6 +779,23 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         color="0.4",
         label=r"ideal camera: $\sqrt{\mu_e}$",
     )
+    if drew_total:
+        ax.plot(
+            [],
+            [],
+            "x",
+            ms=6,
+            color="0.4",
+            label="measured total SNR (Eq. 69)",
+        )
+        ax.plot(
+            [],
+            [],
+            "-.",
+            lw=1.5,
+            color="0.4",
+            label="total SNR model (Eq. 69)",
+        )
     ax.set_xlabel(r"$\mu_e$ (e⁻)")
     ax.set_ylabel("SNR")
     ax.set_title(_title_with_camera(r"SNR vs $\mu_e$ (per band)", camera, roi))
