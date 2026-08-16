@@ -302,13 +302,24 @@ def analyze_dark(seq):
 def fit_flat_stats(rows, dark):
     """PTC fit and derived quantities from roi_stats rows (pure).
 
-    Fits V = K_fit*S + b on (tvar, mean) of the usable rows with the EMVA
-    abscissa S = mean - bias_dn (the photo-induced signal, so the intercept
-    is the read-noise variance offset and cross-checks the Eq. 30 dark
-    sigma_r^2), and derives K12 = 16/K_fit, electron-unit read noises
-    (Eq. 53 quantization-corrected variants included) and the quick
-    upper-bound PRNU estimates. Returns None when fewer than 3 unclipped
-    points are available.
+    EMVA R4 Linear Eq. 50: sigma_y^2 = sigma_y.dark^2 + K*(mu_y - mu_y.dark).
+    For each usable flat point the measured dark temporal variance (matched
+    to the flat's exposure by interpolation over the dark rows, linearly
+    extrapolated outside the dark exposure grid) is subtracted:
+    dV = tvar - sigma_y.dark^2(t_exp), S = mean - bias_dn, and K_fit is the
+    zero-intercept least-squares slope K_fit = sum(S*dV)/sum(S^2) (the
+    standard's p. 23 regression of sigma_y^2 - sigma_y.dark^2 vs the
+    photo-induced signal). Points with dV <= 0 (dark-subtraction noise at
+    the lowest signals) are excluded from the fit when at least 3 positive
+    points remain, keeping the fit selection identical to the PTC plot and
+    the per-point gain check. The intercept of the free (offset) fit of dV
+    vs S is the sanity check: it must come out near 0, and a large deviation
+    flags PTC curvature (PRNU^2*S^2 super-linearity or dark drift). R^2 uses
+    the uncentered denominator sum(dV^2) (the model is through the origin).
+    Derives K12 = 16/K_fit, electron-unit read noises (Eq. 53
+    quantization-corrected variants included) and the quick upper-bound
+    PRNU estimates. Returns None when fewer than 3 unclipped points are
+    available.
 
     Usable = mean < CLIP_DN *and* sat_frac <= SAT_CLIP_FRAC (EMVA 6.6):
     heavily-pinned points can sit below the mean threshold while their
@@ -330,11 +341,47 @@ def fit_flat_stats(rows, dark):
     if len(ok_fit) < 3:
         ok_fit = ok  # never reached saturation: keep all linear points
     capped = len(ok_fit) < len(ok)
-    S = np.array([s["mean"] - dark["bias_dn"] for s in ok_fit])
-    V = np.array([s["tvar"] for s in ok_fit])
-    K_fit, b = np.polyfit(S, V, 1)
-    V_hat = np.polyval([K_fit, b], S)
-    ptc_r2 = 1.0 - np.sum((V - V_hat) ** 2) / np.sum((V - V.mean()) ** 2)
+
+    def _dark_tvar(key):
+        d_ts = np.array([e for e, _ in dark["rows"]])
+        d_vals = np.array([s[key] for _, s in dark["rows"]])
+        if len(d_ts) < 2:
+            med = float(np.median(d_vals)) if len(d_vals) else 0.0
+            return lambda t: med
+        order = np.argsort(d_ts)
+        d_ts, d_vals = d_ts[order], d_vals[order]
+
+        def at(t):
+            t = float(t)
+            if t < d_ts[0]:
+                slope = (d_vals[1] - d_vals[0]) / (d_ts[1] - d_ts[0])
+                return float(d_vals[0] + slope * (t - d_ts[0]))
+            if t > d_ts[-1]:
+                slope = (d_vals[-1] - d_vals[-2]) / (d_ts[-1] - d_ts[-2])
+                return float(d_vals[-1] + slope * (t - d_ts[-1]))
+            return float(np.interp(t, d_ts, d_vals))
+
+        return at
+
+    dark_tvar = _dark_tvar("tvar")
+    dark_tvar_tf = _dark_tvar("tf_tvar")
+    dV_all = np.array([s["tvar"] - dark_tvar(t) for t, s in rows])
+    dV_tf_all = np.array([s["tf_tvar"] - dark_tvar_tf(t) for t, s in rows])
+    ok_ids = {id(s) for s in ok_fit}
+    fit_idx = [i for i, (_, s) in enumerate(rows) if id(s) in ok_ids]
+    pos_idx = [i for i in fit_idx if dV_all[i] > 0]
+    if len(pos_idx) >= 3:
+        fit_idx = pos_idx  # keep fit/plot/check selections identical (dV > 0)
+    if len(fit_idx) < 3:
+        return None
+    S = np.array([rows[i][1]["mean"] - dark["bias_dn"] for i in fit_idx])
+    V = dV_all[fit_idx]
+    K_fit = float(np.sum(S * V) / np.sum(S * S))  # zero-intercept LSQ (Eq. 50)
+    V_hat = K_fit * S
+    # uncentered R^2 (TSS = sum V^2): the model is through the origin, so the
+    # mean-centered denominator is not the right reference
+    ptc_r2 = 1.0 - np.sum((V - V_hat) ** 2) / np.sum(V * V)
+    _, b_free = np.polyfit(S, V, 1)  # free-fit intercept: sanity check, ~0
     K12 = 16.0 / K_fit  # DN16 -> DN12: K12 = 16/(V16/S16)
     sigma_r_e = dark["sigma_r_dn"] * K12 / 16.0
     sigma_r_tf_e = dark["sigma_r_tf_dn"] * K12 / 16.0
@@ -345,9 +392,10 @@ def fit_flat_stats(rows, dark):
     sigma_r_e_q = np.sqrt(max(dark["sigma_r_dn"] ** 2 - sig_q2, 0.0)) * K12 / 16.0
     sigma_r_tf_e_q = np.sqrt(max(dark["sigma_r_tf_dn"] ** 2 - sig_q2, 0.0)) * K12 / 16.0
 
-    # two-frame PTC cross-check: same fit on the Eq. 18 temporal variance
-    V_tf = np.array([s["tf_tvar"] for s in ok_fit])
-    K_fit_tf, b_tf = np.polyfit(S, V_tf, 1)
+    # two-frame PTC cross-check: same dark-subtracted zero-intercept fit on
+    # the Eq. 18 temporal variance
+    V_tf = dV_tf_all[fit_idx]
+    K_fit_tf = float(np.sum(S * V_tf) / np.sum(S * S))
     K12_tf = 16.0 / K_fit_tf
 
     prnu = []
@@ -374,13 +422,16 @@ def fit_flat_stats(rows, dark):
         "Nsat": K12 * 4094,
         "bias_dn": dark["bias_dn"],
         "ptc_slope": K_fit,
-        "ptc_intercept": b,
+        "ptc_intercept": 0.0,  # Eq. 50 zero-intercept fit on the dark-subtracted variance
+        "ptc_intercept_free": b_free,  # sanity check: ~0 for a valid PTC
         "ptc_slope_tf": K_fit_tf,
-        "ptc_intercept_tf": b_tf,
+        "ptc_intercept_tf": 0.0,
         "ptc_r2": ptc_r2,
         "mu_sat_dn": mu_sat,
         "ptc_sat_70_dn": cap if capped else mu_sat,
         "ptc_capped": capped,
+        "dV": dV_all.tolist(),  # sig_y^2 - sig_y,dark^2 per row (aligned with rows)
+        "dV_tf": dV_tf_all.tolist(),  # two-frame variant, aligned with rows
         "prnu_pct": float(np.mean(prnu) * 100) if prnu else None,
         "prnu_tf_pct": float(np.mean(prnu_tf) * 100) if prnu_tf else None,
     }
@@ -421,7 +472,10 @@ def analyze_flats(seq, dark):
     sigma_r_e_q = flat["sigma_r_e_q"]
     sigma_r_tf_e_q = flat["sigma_r_tf_e_q"]
     typer.secho(
-        "\n=== PTC FIT (temporal variance) ===", bold=True, fg=typer.colors.CYAN
+        "\n=== PTC FIT (temporal variance, Eq. 50: dV = K*S, "
+        "S = mu_y - mu_y,dark, dV = sig_y^2 - sig_y,dark^2) ===",
+        bold=True,
+        fg=typer.colors.CYAN,
     )
     typer.echo(
         f"  K (gain)     = {K12:6.2f} e-/DN12   (V/S slope {flat['ptc_slope']:.3f})"
@@ -430,6 +484,10 @@ def analyze_flats(seq, dark):
         f"  K (two-frame)= {K12_tf:6.2f} e-/DN12   "
         f"(slope {flat['ptc_slope_tf']:.3f}, "
         f"Eq. 18; {100 * (K12_tf - K12) / K12:+.1f}% vs N-frame)"
+    )
+    typer.echo(
+        f"  free intercept = {flat['ptc_intercept_free']:+.1f} DN16^2 "
+        f"(sanity check: ~0 for a valid PTC)"
     )
     typer.echo(
         f"  sigma_r      = {sigma_r_e:6.2f} e-  ({dark['sigma_r_dn']:.2f} DN16; "
@@ -451,16 +509,17 @@ def analyze_flats(seq, dark):
             f"covariance, DSNU-subtracted)"
         )
     typer.secho(
-        "\n  per-point gain check (K12 = 16*S/tvar, S = mu_y - mu_y,dark):",
+        "\n  per-point gain check (K12 = 16*S/dV, S = mu_y - mu_y,dark, "
+        "dV = sig_y^2 - sig_y,dark^2; rows with dV <= 0 omitted):",
         bold=True,
         fg=typer.colors.CYAN,
     )
     bias = dark["bias_dn"]
-    for exp_s, s in rows:
-        if s["mean"] < CLIP_DN:
+    for i, (exp_s, s) in enumerate(rows):
+        if s["mean"] < CLIP_DN and flat["dV"][i] > 0:
             typer.echo(
                 f"    {exp_s * 1000:7.2f} ms  S={s['mean'] - bias:9.1f}  "
-                f"K12={16 * (s['mean'] - bias) / s['tvar']:6.2f} e-/DN12"
+                f"K12={16 * (s['mean'] - bias) / flat['dV'][i]:6.2f} e-/DN12"
             )
     # linearity vs exposure
     typer.secho(

@@ -148,7 +148,7 @@ def save_dark_variance_plot(rows, out_dir, roi=None, camera=None, dsnu=None):
             roi,
         )
     )
-    ax.legend(loc="lower right")
+    ax.legend(loc="center left")
     ax.grid(alpha=0.3)
     text = (
         rf"$\sigma_y^2 = {slope:.4g}\,t {offset:+.2f}$ (DN16²)"
@@ -249,40 +249,26 @@ def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
 
 
 def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
-    """Log-log photon transfer curve (temporal variance vs photo-induced signal).
+    """Log-log photon transfer curve (Eq. 50: dark-subtracted variance).
 
     flat/dark are the return dicts from analyze_flats/analyze_dark. The
-    abscissa is the EMVA photo-induced signal mu_y - mu_y,dark (the fit is
-    V = K_fit*S + b with S = mean - bias_dn, so the intercept is the
-    read-noise variance offset); dark points sit at the left edge (x=0,
-    clamped to 1 DN16 for the log axis) with a dashed floor at sigma_r^2.
+    abscissa is the photo-induced signal mu_y - mu_y,dark and the ordinate
+    dV = sigma_y^2 - sigma_y,dark^2 (dark variance matched per exposure),
+    so the fit is the zero-intercept line dV = K*S and the read-noise floor
+    sits at y = 0. The free-fit intercept (~0) is the sanity check.
     Saturated points are excluded (their variance is degenerate). Saves
     ptc_variance_vs_mean.png.
     """
     bias = flat["bias_dn"]
-    fig, ax = plt.subplots(figsize=(8, 5))
-
-    dx = np.array([s["mean"] - bias for _, s in dark["rows"]])
-    dv = np.array([s["tvar"] for _, s in dark["rows"]])
-    m = dv > 0
-    if m.any():
-        ax.loglog(
-            np.maximum(dx[m], 1.0),
-            dv[m],
-            "^",
-            color="tab:green",
-            ms=6,
-            label="dark (read-noise region)",
-        )
-
     fx = np.array([s["mean"] for _, s in flat["rows"]])
-    fv = np.array([s["tvar"] for _, s in flat["rows"]])
+    fv = np.array(flat["dV"])
     cap = flat["ptc_sat_70_dn"]
     fit_mask = (fx <= cap) & (fx < clip_dn) & (fv > 0)
     if fit_mask.sum() < 2:
         typer.secho("  ! too few points for PTC plot", fg=typer.colors.YELLOW)
-        plt.close(fig)
         return None
+
+    fig, ax = plt.subplots(figsize=(8, 5))
     ax.loglog(
         fx[fit_mask] - bias, fv[fit_mask], "o", ms=5, label="flat (fit, 0-70% sat)"
     )
@@ -301,20 +287,12 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
     x_line = np.linspace(fx[fit_mask].min(), fx[fit_mask].max(), 200) - bias
     ax.loglog(
         x_line,
-        np.polyval([flat["ptc_slope"], flat["ptc_intercept"]], x_line),
+        flat["ptc_slope"] * x_line,
         "-",
         lw=1.5,
-        label="linear fit",
+        label="linear fit (zero intercept)",
     )
 
-    sigma_r2 = dark["sigma_r_dn"] ** 2
-    ax.axhline(
-        sigma_r2,
-        ls="--",
-        color="0.4",
-        lw=1.2,
-        label=rf"$\sigma_r^2$ read-noise floor = {sigma_r2:.1f} DN16²",
-    )
     ax.axvline(
         2**16 - bias,
         ls="--",
@@ -332,10 +310,11 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
         )
 
     ax.set_xlabel(r"$\mu_y - \mu_{y,\mathrm{dark}}$ (DN16)")
-    ax.set_ylabel(r"$\sigma_y^2$ (DN16²)")
+    ax.set_ylabel(r"$\sigma_y^2 - \sigma_{y,\mathrm{dark}}^2$ (DN16²)")
     ax.set_title(
         _title_with_camera(
-            r"Photon transfer curve: $\sigma_y^2$ vs $\mu_y - \mu_{y,\mathrm{dark}}$",
+            r"Photon transfer curve: $\sigma_y^2 - \sigma_{y,\mathrm{dark}}^2$ "
+            r"vs $\mu_y - \mu_{y,\mathrm{dark}}$",
             camera,
             roi,
         )
@@ -346,15 +325,14 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
     ax.text(
         0.03,
         0.97,
-        rf"$\sigma_y^2 = {flat['ptc_slope']:.4g}\,(\mu_y - "
-        rf"\mu_{{y,\mathrm{{dark}}}}) {flat['ptc_intercept']:+.1f}$"
-        " (DN16²)"
+        rf"$\Delta\sigma_y^2 = {flat['ptc_slope']:.4g}\,(\mu_y - "
+        rf"\mu_{{y,\mathrm{{dark}}}})$ (DN16²)"
         "\n"
         f"R² = {flat['ptc_r2']:.6f}"
         "\n"
         f"K = {flat['K12']:.2f} e⁻/DN12"
         "\n"
-        rf"$\sigma_r$ = {dark['sigma_r_dn']:.2f} DN16",
+        rf"free intercept = {flat['ptc_intercept_free']:+.1f} DN16² (~0 check)",
         transform=ax.transAxes,
         va="top",
         fontsize=10,
@@ -652,8 +630,10 @@ def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=No
 def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
     """Log-log photon transfer curve with one curve + fit per band.
 
-    Abscissa is the photo-induced signal mu_y - mu_y,dark (the per-band fit
-    is on S = mean - bias_dn). Saves ptc_variance_vs_mean_bands.png.
+    Abscissa is the photo-induced signal mu_y - mu_y,dark and the ordinate
+    dV = sigma_y^2 - sigma_y,dark^2 (per-band dark variance matched per
+    exposure, from the shared fit), so the fit line is dV = K*S through the
+    origin. Saves ptc_variance_vs_mean_bands.png.
     """
     fig, ax = plt.subplots(figsize=(8, 5))
     drew = False
@@ -663,7 +643,7 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
             continue
         bias = f["bias_dn"]
         x = np.array([s["mean"] for _, s in f["rows"]])
-        v = np.array([s["tvar"] for _, s in f["rows"]])
+        v = np.array(f["dV"])
         cap = f["ptc_sat_70_dn"]
         m = (x <= cap) & (x < clip_dn) & (v > 0)
         if m.sum() < 2:
@@ -682,7 +662,7 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         xl = np.linspace(x[m].min(), x[m].max(), 100) - bias
         ax.loglog(
             xl,
-            np.polyval([f["ptc_slope"], f["ptc_intercept"]], xl),
+            f["ptc_slope"] * xl,
             "-",
             lw=1.2,
             color=color,
@@ -693,11 +673,11 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         plt.close(fig)
         return None
     ax.set_xlabel(r"$\mu_y - \mu_{y,\mathrm{dark}}$ (DN16)")
-    ax.set_ylabel(r"$\sigma_y^2$ (DN16²)")
+    ax.set_ylabel(r"$\sigma_y^2 - \sigma_{y,\mathrm{dark}}^2$ (DN16²)")
     ax.set_title(
         _title_with_camera(
-            r"Photon transfer curve: $\sigma_y^2$ vs "
-            r"$\mu_y - \mu_{y,\mathrm{dark}}$ (per band)",
+            r"Photon transfer curve: $\sigma_y^2 - \sigma_{y,\mathrm{dark}}^2$ "
+            r"vs $\mu_y - \mu_{y,\mathrm{dark}}$ (per band)",
             camera,
             roi,
         )
