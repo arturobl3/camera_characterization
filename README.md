@@ -3,7 +3,8 @@
 Acquisition CLI for photon-transfer-curve (PTC) camera characterization, following
 EMVA 1288 / Janesick methodology. Vendor-agnostic backend design; currently
 implements the **Player One Astronomy** backend (tested with Apollo-M / IMX174 on
-macOS, SDK 3.10.1).
+macOS, SDK 3.10.1) and the **Basler** backend via pypylon (tested with
+acA1920-155um / IMX174 over USB3 on Windows, pypylon 26.7).
 
 ## Quick start (macOS)
 
@@ -29,7 +30,9 @@ uv run camchar analyze --data data
 
 `python -m camchar ...` also works (same package). The console script and
 module are interchangeable; on Windows lab machines run the same commands from
-a `uv sync`'d checkout.
+a `uv sync`'d checkout. Select the camera vendor with `--vendor basler`
+(default `playerone`); Basler `--gain` is in dB (float, 0–24), Player One gain
+is an integer.
 
 Acquired sequences are organized per camera:
 `<data root>/<vendor>_<model>_(<sensor>)/{dark,flat}/` (default root `data`,
@@ -141,6 +144,7 @@ camera_characterization/
 │   └── backends/
 │       ├── base.py            # CameraBackend ABC
 │       ├── playerone.py       # Player One backend (pitfalls encoded)
+│       ├── basler.py          # Basler backend (pypylon, software trigger)
 │       └── __init__.py        # backend registry
 ├── vendor/
 │   └── playerone/
@@ -178,6 +182,19 @@ Put the SDK binary for your OS in `vendor/playerone/lib/`:
   copy `lib/x64/PlayerOneCamera.dll` into `vendor/playerone/lib/`.
   Install the Player One camera driver from their software page (WinUSB).
 - **Linux** — from the Linux SDK tarball: copy the four `.so` files for your arch.
+
+## Basler (pypylon) setup
+
+`uv add pypylon` — the wheel bundles the pylon runtime (Windows/macOS/Linux).
+If the camera does not enumerate, install the pylon Software Suite to provide
+the USB3 driver. The backend grabs `Mono12` (unpacked) and shifts `<<4` to
+DN16, so the stored data and every downstream constant match the Player One
+path. Per-frame software triggering is used (no stale free-run buffers when
+the exposure changes between snaps); the camera's stored user set is reset to
+Default on `configure()` so pylon Viewer leftovers cannot leak in. Exposures
+outside the camera range (minimum 21 µs on the acA1920-155um) are clamped
+with a warning, and the effective exposure is what lands in metadata and
+filenames.
 
 ## Known pitfalls (empirical, macOS SDK 3.10.1)
 

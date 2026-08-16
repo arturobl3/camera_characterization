@@ -32,3 +32,15 @@ except OSError as _e:
         f"playerone backend unavailable (SDK library not installed): {_e}",
         stacklevel=2,
     )
+
+try:
+    from . import basler  # noqa: E402, F401  (registers the basler backend on import)
+except (ImportError, OSError) as _e:
+    # basler.py self-guards the pypylon import (sets pylon = None); this only
+    # fires for pypylon DLL-load failures (OSError) or unrelated import errors.
+    # Offline commands must still work.
+    import warnings
+
+    warnings.warn(
+        f"basler backend unavailable (pypylon not installed): {_e}", stacklevel=2
+    )

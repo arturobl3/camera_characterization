@@ -84,14 +84,15 @@ def _run_sequence(vendor, out, exposures_ms, frames, gain, notes, seq_type):
         fg=typer.colors.CYAN,
     )
     info = backend.open()
+    pixel = info["pixel_size_um"]
     typer.echo(
         f"[{seq_type}] camera: {info['model']} SN={info['serial']} "
-        f"sensor={info['sensor']} pixel={info['pixel_size_um']}um"
+        f"sensor={info['sensor']}" + (f" pixel={pixel:g}um" if pixel else "")
     )
     backend.configure(gain=gain)
     temp = backend.sensor_temp_c()
     out_dir = Path(out) / camera_dir_name(info) / seq_type
-    typer.echo(f"[{seq_type}] sensor temp: {temp:.1f} C, gain: {gain}")
+    typer.echo(f"[{seq_type}] sensor temp: {temp:.1f} C, gain: {gain:g}")
     typer.echo(f"[{seq_type}] saving to {out_dir}")
 
     total_frames = 0
@@ -102,10 +103,13 @@ def _run_sequence(vendor, out, exposures_ms, frames, gain, notes, seq_type):
         temp_before = backend.sensor_temp_c()
         stack = backend.snap(exp_s, frames)
         temp_after = backend.sensor_temp_c()
+        # backends may clamp to the camera's exposure range; record the
+        # effective exposure so metadata/filenames match what was captured
+        eff_s = getattr(backend, "last_exposure_s", exp_s)
         save_sequence(
             out_dir,
             seq_type,
-            exp_s,
+            eff_s,
             gain,
             stack,
             info,
@@ -132,9 +136,10 @@ def _warmup_sensor(vendor):
         f"[warmup] vendor={vendor}  opening camera...", bold=True, fg=typer.colors.CYAN
     )
     info = backend.open()
+    pixel = info["pixel_size_um"]
     typer.echo(
         f"[warmup] camera: {info['model']} SN={info['serial']} "
-        f"sensor={info['sensor']} pixel={info['pixel_size_um']}um"
+        f"sensor={info['sensor']}" + (f" pixel={pixel:g}um" if pixel else "")
     )
     backend.configure(gain=0)
 
@@ -246,7 +251,7 @@ def _source_stability_check(vendor, exposures_ms, frames, gain):
     )
     backend.configure(gain=gain)
     temp = backend.sensor_temp_c()
-    typer.echo(f"[stability] sensor temp: {temp:.1f} C, gain: {gain}")
+    typer.echo(f"[stability] sensor temp: {temp:.1f} C, gain: {gain:g}")
     typer.echo(
         f"[stability] deviation of each frame mean vs frame 0 (reference); "
         f"warning threshold {SOURCE_STABILITY_TOL_PCT:g}%"
@@ -340,7 +345,9 @@ def get_dark_frames(
         f"(default: {_ms_list(DEFAULT_EXPOSURES_MS)})",
     ),
     frames: int = typer.Option(DEFAULT_FRAMES, help="frames per exposure"),
-    gain: int = typer.Option(0, help="fixed gain"),
+    gain: float = typer.Option(
+        0.0, help="fixed gain (dB for basler, unitless for playerone)"
+    ),
     notes: str = typer.Option("dark", help="metadata notes, e.g. 'lens cap on'"),
 ):
     """Acquire dark frames (lens cap ON, dark room)."""
@@ -364,7 +371,9 @@ def get_flat_frames(
         f"(default: {_ms_list(DEFAULT_EXPOSURES_MS)})",
     ),
     frames: int = typer.Option(DEFAULT_FRAMES, help="frames per exposure"),
-    gain: int = typer.Option(0, help="fixed gain"),
+    gain: float = typer.Option(
+        0.0, help="fixed gain (dB for basler, unitless for playerone)"
+    ),
     notes: str = typer.Option("flat", help="metadata notes, e.g. 'green LED ~530nm'"),
 ):
     """Acquire flat frames (uniform broadband illumination)."""
@@ -420,7 +429,9 @@ def source_stability_check(
     frames: int = typer.Option(
         SOURCE_STABILITY_FRAMES, help="consecutive frames per exposure"
     ),
-    gain: int = typer.Option(0, help="fixed gain"),
+    gain: float = typer.Option(
+        0.0, help="fixed gain (dB for basler, unitless for playerone)"
+    ),
 ):
     """Check the light-source stability for flat-field measurements."""
     rc = _source_stability_check(ctx.obj["vendor"], exposures, frames, gain)

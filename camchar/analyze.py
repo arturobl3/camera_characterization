@@ -50,7 +50,7 @@ QUANT_STEP_DN16 = 16.0  # DN16 per 12-bit LSB (DN12 << 4 storage)
 DEFAULT_ROI = (500, 900, 750, 1150)  # playerone Apollo-M central 400x400
 DEFAULT_ROI_SPECIM = (156, 356, 156, 356)  # SPECIM IQ 512x512 central 200x200
 
-_VENDOR_NAMES = {"playerone": "Player One"}
+_VENDOR_NAMES = {"playerone": "Player One", "basler": "Basler"}
 
 
 def load_camera_meta(data_dir):
@@ -372,7 +372,9 @@ def fit_flat_stats(rows, dark):
     pos_idx = [i for i in fit_idx if dV_all[i] > 0]
     if len(pos_idx) >= 3:
         fit_idx = pos_idx  # keep fit/plot/check selections identical (dV > 0)
-    if len(fit_idx) < 3:
+    if len(fit_idx) < 3 or not any(dV_all[i] > 0 for i in fit_idx):
+        # degenerate: no point carries positive dark-subtracted variance
+        # (e.g. flats acquired with the lens cap on)
         return None
     S = np.array([rows[i][1]["mean"] - dark["bias_dn"] for i in fit_idx])
     V = dV_all[fit_idx]
@@ -380,7 +382,8 @@ def fit_flat_stats(rows, dark):
     V_hat = K_fit * S
     # uncentered R^2 (TSS = sum V^2): the model is through the origin, so the
     # mean-centered denominator is not the right reference
-    ptc_r2 = 1.0 - np.sum((V - V_hat) ** 2) / np.sum(V * V)
+    tss = float(np.sum(V * V))
+    ptc_r2 = 1.0 - np.sum((V - V_hat) ** 2) / tss if tss > 0 else float("nan")
     _, b_free = np.polyfit(S, V, 1)  # free-fit intercept: sanity check, ~0
     K12 = 16.0 / K_fit  # DN16 -> DN12: K12 = 16/(V16/S16)
     sigma_r_e = dark["sigma_r_dn"] * K12 / 16.0
@@ -459,7 +462,8 @@ def analyze_flats(seq, dark):
     flat = fit_flat_stats(rows, dark)
     if flat is None:
         typer.secho(
-            "  ! too few unclipped points -- check illumination level",
+            "  ! flat fit failed: <3 usable points (unclipped, positive "
+            "dark-subtracted variance) -- check illumination / lens cap",
             fg=typer.colors.YELLOW,
         )
         return None

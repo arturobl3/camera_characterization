@@ -133,6 +133,10 @@ class PlayerOneBackend(CameraBackend):
         return dict(self._info)
 
     def configure(self, gain=0):
+        if float(gain) != int(gain):
+            raise RuntimeError(
+                f"Player One gain must be an integer, got {gain!r} (basler uses dB)"
+            )
         p = self._props
         poa.SetImageStartPos(self._cid, 0, 0)
         poa.SetImageSize(self._cid, p.maxWidth, p.maxHeight)

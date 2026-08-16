@@ -16,8 +16,8 @@ def stem_for(seq_type, exposure_s, gain):
     exp_ms = exposure_s * 1000
     is_integer_ms = abs(exp_ms - round(exp_ms)) < 1e-9
     if exp_ms >= 1 and is_integer_ms:
-        return f"{seq_type}_{int(round(exp_ms)):05d}ms_g{gain}"
-    return f"{seq_type}_{int(round(exp_ms * 1000)):05d}us_g{gain}"
+        return f"{seq_type}_{int(round(exp_ms)):05d}ms_g{gain:g}"
+    return f"{seq_type}_{int(round(exp_ms * 1000)):05d}us_g{gain:g}"
 
 
 def camera_dir_name(info):

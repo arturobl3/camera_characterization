@@ -11,7 +11,7 @@
 
 ## Hardware dependence
 
-- `get-dark-frames` / `get-flat-frames` / `warmup-sensor` / `source-stability-check` require a physically connected Player One camera (direct USB, no hub). Don't run acquisition commands as a code check.
+- `get-dark-frames` / `get-flat-frames` / `warmup-sensor` / `source-stability-check` require a physically connected Player One or Basler camera (direct USB, no hub). Don't run acquisition commands as a code check.
 - `analyze` is offline: reads `<camera>/dark/` + `<camera>/flat/` via their `metadata.json`; writes plots to `outputs/<vendor>_<model>_(<sensor>)/` (CWD, gitignored) via `camchar/plots.py` (matplotlib, Agg backend).
 - The backend retries camera enumeration for up to 60 s at `open()` by design (USB enumeration is flaky); don't shorten or remove this.
 - SPECIM IQ per-band analysis (`camchar/band_analyze.py` + `camchar/specim.py`) reads the ENVI export under `data/SPECIM_IQ/` (~48 GB; full run takes ~15–25 min). A quick check: `uv run camchar analyze --data data/SPECIM_IQ --help` parses; for a fast functional smoke test symlink 3 acquisitions per exposure into a scratch dir and analyze that.
@@ -22,6 +22,11 @@
 - `PlayerOneBackend.close()` is intentionally a no-op: `CloseCamera()` wedges the device on macOS until physically replugged. Process exit is the cleanup.
 - Exposure uses config 31 (`POA_EXP`, seconds, float) with fallback to config 0 (`POA_EXPOSURE`, µs, int).
 - SDK binaries are OS-specific and must be placed in `vendor/playerone/lib/` (loading is platform-aware in the wrapper). Windows: `PlayerOneCamera.dll` + WinUSB driver. macOS: dylib(s) + Homebrew libusb patched in via `install_name_tool` (see README).
+
+## Basler backend (pypylon) — conventions
+
+- `camchar/backends/basler.py` drives Basler cameras via pypylon (wheel bundles the pylon runtime; if enumeration fails, the pylon Software Suite USB3 driver is missing). `--vendor basler` selects it; `--gain` is float dB (Player One keeps its int coercion).
+- Grabs `PixelFormat Mono12` (unpacked) with a per-frame software trigger (`TriggerMode=FrameStart/Software`): free-run buffers would be stale after an exposure change. Frames are `<<4` to DN16 at the backend, matching the playerone path so analyze.py constants/fits are shared. `configure()` loads the camera's Default user set first so pylon Viewer leftovers (test pattern, ROI, LUT) never leak in. Gain via the `Gain` node (dB); temp via `DeviceTemperature` (NaN fallback). Exposures below/above the camera range (min 21 µs on acA1920-155um) are clamped in `snap()` with a warning, and the effective exposure is exposed as `last_exposure_s` (cli records it in metadata/filenames). `close()` is a real close (StopGrabbing + Close) — no wedging like playerone macOS.
 
 ## Architecture and conventions
 
