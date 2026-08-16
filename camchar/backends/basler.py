@@ -38,6 +38,19 @@ _KNOWN_MODELS = {
 
 _GRAB_TIMEOUT_MARGIN_MS = 5000  # same margin as the playerone GetImageData call
 
+# Digital black-level offset target, in 12-bit LSB (DN12). The IMX174 default
+# is ~0, which pins the read-noise distribution at zero (dark frames 97% == 0)
+# and censors every variance statistic. EMVA wants < 0.5% of pixels at zero;
+# ~3 * sigma_r (sigma_r ~ 0.8 DN12) is the comfortable floor. Keep it small:
+# every DN12 of offset eats 1/4095 of the top-end range.
+_BLACK_LEVEL_DN12 = 8
+
+# Measured on the acA1920-155um (IMX174): the BlackLevel node's range is
+# 0..31.9375 (5.4 fixed point) and its full-scale maps to ~511 DN12 of offset
+# -> ~16 DN12 per node unit (verified 2026-08: node 31.9375 -> dark mean
+# 8159.8 DN16 = 510 DN12). Set the node value from the DN12 target this way.
+_DN12_PER_BLACKLEVEL_UNIT = 16.0
+
 
 @register("basler")
 class BaslerBackend(CameraBackend):
@@ -157,13 +170,14 @@ class BaslerBackend(CameraBackend):
         except Exception:
             pass
         # disable auto features so nothing drifts during a sequence
-        for node_name in ("GainAuto", "ExposureAuto"):
+        for node_name in ("GainAuto", "ExposureAuto", "BlackLevelAuto"):
             node = self._node(cam, node_name)
             if node is not None:
                 try:
                     node.SetValue("Off")
                 except Exception:
                     pass
+        self._configure_black_level(cam)
         cam.OffsetX.SetValue(0)
         cam.OffsetY.SetValue(0)
         cam.Width.SetValue(cam.SensorWidth.GetValue())
@@ -190,6 +204,55 @@ class BaslerBackend(CameraBackend):
             self._exp_min_us = self._exp_max_us = None
         self._info["gain"] = float(gain)
         return self._info
+
+    def _configure_black_level(self, cam, target_dn12=_BLACK_LEVEL_DN12):
+        """Set a digital black-level offset so dark frames don't underflow.
+
+        The IMX174's default black level is ~0: with no offset the read-noise
+        distribution (sigma_r ~ 6-7 e-) is pinned against zero (== 97% of dark
+        pixels sat at exact 0 in the Aug 2026 acA1920-155um acquisition), which
+        censors the dark histogram and corrupts every variance-based quantity.
+        EMVA requires < 0.5% of pixels at zero; target ~ 3 * sigma_r in DN12.
+        The 'BlackLevel' node is in 12-bit LSB on this sensor family and is set
+        *after* the Default user set is loaded so it cannot be overridden.
+        """
+        node = self._node(cam, "BlackLevel")
+        info = self._info or {}
+        if node is None:
+            print("  [basler] WARNING: no BlackLevel node — dark frames may "
+                  "underflow; set an offset in pylon Viewer and save 'Default'")
+            info["black_level_dn12"] = None
+            return
+        try:
+            lo, hi = float(node.GetMin()), float(node.GetMax())
+            value = min(
+                max(float(target_dn12) / _DN12_PER_BLACKLEVEL_UNIT, lo), hi
+            )
+            node.SetValue(value)
+            # Analog_All is the mono selector on ace models; 'Analog' is a
+            # fallback found on some others. Doesn't hurt to try both.
+            sel = self._node(cam, "BlackLevelSelector")
+            if sel is not None:
+                try:
+                    sel.SetValue("Analog_All")
+                except Exception:
+                    try:
+                        sel.SetValue("Analog")
+                    except Exception:
+                        pass
+            applied = float(node.GetValue())
+            applied_dn12 = applied * _DN12_PER_BLACKLEVEL_UNIT
+            info["black_level_dn12"] = applied_dn12
+            readback_dn16 = applied_dn12 * 16.0
+            print(
+                f"  [basler] black level: node range {lo:g}..{hi:g}, "
+                f"set node {applied:g} -> ~{applied_dn12:g} DN12 "
+                f"({readback_dn16:g} DN16) mean dark offset"
+            )
+        except Exception as exc:
+            info["black_level_dn12"] = None
+            print(f"  [basler] WARNING: failed to set BlackLevel ({exc}); "
+                  "dark frames may underflow")
 
     def sensor_temp_c(self):
         try:
