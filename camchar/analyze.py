@@ -25,10 +25,11 @@ import json
 from pathlib import Path
 
 import numpy as np
+import typer
 
 from .io_utils import camera_dir_name, stem_for
 from .plots import (
-    save_dark_plot,
+    save_dark_mean_plot,
     save_dark_variance_plot,
     save_linearity_plot,
     save_ptc_plot,
@@ -41,9 +42,12 @@ DARK_CURRENT_FLAT_MAX_EXP = (
 )
 SAT_MAX_DN = 65504  # sensor digital maximum (12-bit 4094 << 4)
 SAT_CLIP_FRAC = 0.002  # EMVA R4 Linear 6.6: saturation = <= 0.2% pixels at max
+PTC_FIT_SAT_FRAC = (
+    0.7  # EMVA R4 Linear PTC regression range: minimum value to 70% saturation
+)
 QUANT_STEP_DN16 = 16.0  # DN16 per 12-bit LSB (DN12 << 4 storage)
 
-DEFAULT_ROI = (600, 800, 850, 1050)  # playerone Apollo-M central 200x200
+DEFAULT_ROI = (500, 900, 750, 1150)  # playerone Apollo-M central 400x400
 DEFAULT_ROI_SPECIM = (156, 356, 156, 356)  # SPECIM IQ 512x512 central 200x200
 
 _VENDOR_NAMES = {"playerone": "Player One"}
@@ -88,7 +92,7 @@ def resolve_data_dir(data_dir):
 
     d = Path(data_dir)
     if not d.exists():
-        print(f"  ! data dir not found: {d}")
+        typer.secho(f"  ! data dir not found: {d}", fg=typer.colors.YELLOW)
         return None
     if (d / "dark").exists() or (d / "flat").exists():
         return d, "npy"
@@ -107,15 +111,19 @@ def resolve_data_dir(data_dir):
     if len(candidates) == 1:
         return candidates[0]
     if not candidates:
-        print(
+        typer.secho(
             f"  ! no camera data under {d} "
             f"(expected <root>/<vendor>_<model>_(<sensor>)/dark|flat "
-            f"or a SPECIM IQ 'dark frames'/'flat-field frames' layout)"
+            f"or a SPECIM IQ 'dark frames'/'flat-field frames' layout)",
+            fg=typer.colors.YELLOW,
         )
         return None
-    print("  ! multiple camera dirs found -- pass one explicitly with --data:")
+    typer.secho(
+        "  ! multiple camera dirs found -- pass one explicitly with --data:",
+        fg=typer.colors.YELLOW,
+    )
     for c, layout in candidates:
-        print(f"      {c}  ({layout})")
+        typer.echo(f"      {c}  ({layout})")
     return None
 
 
@@ -128,7 +136,10 @@ def load_sequence(data_dir, seq_type):
     d = Path(data_dir) / seq_type
     meta_path = d / "metadata.json"
     if not meta_path.exists():
-        print(f"  ! no metadata at {meta_path} -- nothing to analyze")
+        typer.secho(
+            f"  ! no metadata at {meta_path} -- nothing to analyze",
+            fg=typer.colors.YELLOW,
+        )
         return []
     entries = json.loads(meta_path.read_text())
     seen = set()
@@ -142,7 +153,7 @@ def load_sequence(data_dir, seq_type):
         seen.add(key)
         p = d / f"{stem_for(seq_type, m['exposure_s'], m['gain'])}.npy"
         if not p.exists():
-            print(f"  ! missing {p.name}, skipping")
+            typer.secho(f"  ! missing {p.name}, skipping", fg=typer.colors.YELLOW)
             continue
         out.append((m["exposure_s"], np.load(p)))
     out.sort(key=lambda x: x[0])
@@ -266,14 +277,18 @@ def fit_dark_stats(rows):
 
 def analyze_dark(seq):
     """Bias floor, dark current, read noise from dark frames."""
-    print("=== DARK (tvar/svar = N-frame; tf = two-frame cross-check) ===")
+    typer.secho(
+        "=== DARK (tvar/svar = N-frame; tf = two-frame cross-check) ===",
+        bold=True,
+        fg=typer.colors.CYAN,
+    )
     if not seq:
         return None
     rows = []
     for exp_s, st in seq:
         s = roi_stats(st, ROI)
         rows.append((exp_s, s))
-        print(
+        typer.echo(
             f"  {exp_s * 1000:8.1f} ms  mean {s['mean']:8.2f}  "
             f"tvar {s['tvar']:9.2f}  tf {s['tf_tvar']:9.2f}  "
             f"svar {s['svar']:8.2f}  tfs {s['tf_svar']:8.2f}"
@@ -295,17 +310,24 @@ def fit_flat_stats(rows, dark):
     Usable = mean < CLIP_DN *and* sat_frac <= SAT_CLIP_FRAC (EMVA 6.6):
     heavily-pinned points can sit below the mean threshold while their
     variance has collapsed (pinned pixels don't fluctuate), which would
-    bend the PTC fit.
+    bend the PTC fit. Per EMVA R4 Linear the regression must use all data
+    points between the minimum value and 70% saturation (mu_sat = the
+    measured saturation point, i.e. the largest mean passing the 6.6 test),
+    so points above PTC_FIT_SAT_FRAC * mu_sat are excluded; when the data
+    never reaches saturation (fewer than 3 points under the cap) all points
+    are kept.
     """
-    usable = [
-        (s["mean"], s["tvar"])
-        for _, s in rows
-        if s["mean"] < CLIP_DN and s["sat_frac"] <= SAT_CLIP_FRAC
-    ]
-    if len(usable) < 3:
+    ok = [s for _, s in rows if s["mean"] < CLIP_DN and s["sat_frac"] <= SAT_CLIP_FRAC]
+    if len(ok) < 3:
         return None
-    S = np.array([u[0] for u in usable])
-    V = np.array([u[1] for u in usable])
+    mu_sat = max(s["mean"] for s in ok)
+    cap = PTC_FIT_SAT_FRAC * mu_sat
+    ok_fit = [s for s in ok if s["mean"] <= cap]
+    if len(ok_fit) < 3:
+        ok_fit = ok  # never reached saturation: keep all linear points
+    capped = len(ok_fit) < len(ok)
+    S = np.array([s["mean"] for s in ok_fit])
+    V = np.array([s["tvar"] for s in ok_fit])
     K_fit, b = np.polyfit(S, V, 1)
     V_hat = np.polyval([K_fit, b], S)
     ptc_r2 = 1.0 - np.sum((V - V_hat) ** 2) / np.sum((V - V.mean()) ** 2)
@@ -320,13 +342,7 @@ def fit_flat_stats(rows, dark):
     sigma_r_tf_e_q = np.sqrt(max(dark["sigma_r_tf_dn"] ** 2 - sig_q2, 0.0)) * K12 / 16.0
 
     # two-frame PTC cross-check: same fit on the Eq. 18 temporal variance
-    V_tf = np.array(
-        [
-            s["tf_tvar"]
-            for _, s in rows
-            if s["mean"] < CLIP_DN and s["sat_frac"] <= SAT_CLIP_FRAC
-        ]
-    )
+    V_tf = np.array([s["tf_tvar"] for s in ok_fit])
     K_fit_tf, b_tf = np.polyfit(S, V_tf, 1)
     K12_tf = 16.0 / K_fit_tf
 
@@ -358,6 +374,9 @@ def fit_flat_stats(rows, dark):
         "ptc_slope_tf": K_fit_tf,
         "ptc_intercept_tf": b_tf,
         "ptc_r2": ptc_r2,
+        "mu_sat_dn": mu_sat,
+        "ptc_sat_70_dn": cap if capped else mu_sat,
+        "ptc_capped": capped,
         "prnu_pct": float(np.mean(prnu) * 100) if prnu else None,
         "prnu_tf_pct": float(np.mean(prnu_tf) * 100) if prnu_tf else None,
     }
@@ -365,14 +384,18 @@ def fit_flat_stats(rows, dark):
 
 def analyze_flats(seq, dark):
     """K, Nsat, PRNU from the flat sweep (temporal variance)."""
-    print("\n=== FLAT (tvar/svar = N-frame; tf = two-frame cross-check) ===")
+    typer.secho(
+        "\n=== FLAT (tvar/svar = N-frame; tf = two-frame cross-check) ===",
+        bold=True,
+        fg=typer.colors.CYAN,
+    )
     if not seq:
         return None
     rows = []
     for exp_s, st in seq:
         s = roi_stats(st, ROI)
         rows.append((exp_s, s))
-        print(
+        typer.echo(
             f"  {exp_s * 1000:8.1f} ms  mean {s['mean']:10.2f}  "
             f"tvar {s['tvar']:12.2f}  tf {s['tf_tvar']:12.2f}  "
             f"svar {s['svar']:12.2f}  tfs {s['tf_svar']:12.2f}"
@@ -380,7 +403,10 @@ def analyze_flats(seq, dark):
 
     flat = fit_flat_stats(rows, dark)
     if flat is None:
-        print("  ! too few unclipped points -- check illumination level")
+        typer.secho(
+            "  ! too few unclipped points -- check illumination level",
+            fg=typer.colors.YELLOW,
+        )
         return None
     flat["rows"] = rows
 
@@ -390,51 +416,73 @@ def analyze_flats(seq, dark):
     sigma_r_tf_e = flat["sigma_r_tf_e"]
     sigma_r_e_q = flat["sigma_r_e_q"]
     sigma_r_tf_e_q = flat["sigma_r_tf_e_q"]
-    print("\n=== PTC FIT (temporal variance) ===")
-    print(f"  K (gain)     = {K12:6.2f} e-/DN12   (V/S slope {flat['ptc_slope']:.3f})")
-    print(
+    typer.secho(
+        "\n=== PTC FIT (temporal variance) ===", bold=True, fg=typer.colors.CYAN
+    )
+    typer.echo(
+        f"  K (gain)     = {K12:6.2f} e-/DN12   (V/S slope {flat['ptc_slope']:.3f})"
+    )
+    typer.echo(
         f"  K (two-frame)= {K12_tf:6.2f} e-/DN12   "
         f"(slope {flat['ptc_slope_tf']:.3f}, "
         f"Eq. 18; {100 * (K12_tf - K12) / K12:+.1f}% vs N-frame)"
     )
-    print(
+    typer.echo(
         f"  sigma_r      = {sigma_r_e:6.2f} e-  ({dark['sigma_r_dn']:.2f} DN16; "
         f"Eq. 53 quant-corrected {sigma_r_e_q:.2f} e-)"
     )
-    print(
+    typer.echo(
         f"  sigma_r (tf) = {sigma_r_tf_e:6.2f} e-  ({dark['sigma_r_tf_dn']:.2f} DN16; "
         f"corrected {sigma_r_tf_e_q:.2f} e-)"
     )
-    print(f"  Nsat         = {flat['Nsat']:7.0f} e- (at 12-bit clip 4094)")
+    typer.echo(f"  Nsat         = {flat['Nsat']:7.0f} e- (at 12-bit clip 4094)")
     if flat["prnu_pct"] is not None:
-        print(
+        typer.echo(
             f"  PRNU c       = {flat['prnu_pct']:5.2f} %  (upper bound, "
             f"includes diffuser texture)"
         )
     if flat["prnu_tf_pct"] is not None:
-        print(
+        typer.echo(
             f"  PRNU c (tf)  = {flat['prnu_tf_pct']:5.2f} %  (Eq. 32 "
             f"covariance, DSNU-subtracted)"
         )
-    print("\n  per-point gain check (K12 = 16*S/tvar):")
+    typer.secho(
+        "\n  per-point gain check (K12 = 16*S/tvar):",
+        bold=True,
+        fg=typer.colors.CYAN,
+    )
     for exp_s, s in rows:
         if s["mean"] < CLIP_DN:
-            print(
+            typer.echo(
                 f"    {exp_s * 1000:7.2f} ms  S={s['mean']:9.1f}  "
                 f"K12={16 * s['mean'] / s['tvar']:6.2f} e-/DN12"
             )
     # linearity vs exposure
-    print("\n=== LINEARITY (mean vs exposure, bias-subtracted) ===")
+    typer.secho(
+        "\n=== LINEARITY (mean vs exposure, bias-subtracted) ===",
+        bold=True,
+        fg=typer.colors.CYAN,
+    )
     bias = dark["bias_dn"]
     for i in range(1, len(rows)):
         e0, s0 = rows[i - 1][0], rows[i - 1][1]["mean"] - bias
         e1, s1 = rows[i][0], rows[i][1]["mean"] - bias
         if s0 > 0 and s1 > 0:
-            print(
+            typer.echo(
                 f"  {e0 * 1000:7.2f}->{e1 * 1000:7.2f} ms  ratio {s1 / s0:.3f} "
                 f"(ideal {e1 / e0:.3f})"
             )
     return flat
+
+
+def dsnu1288_core(d_img, tvar, n):
+    """Eq. 66 DSNU1288 (DN16): sqrt of highpass dark variance minus the Eq. 36 temporal residual (pure).
+
+    d_img is the frame-averaged dark ROI image (Eq. 33), tvar its temporal
+    variance, n the frame count; the highpass is the Section 8.1 filter.
+    """
+    s2 = max(float(highpass(d_img).var()) - tvar / n, 0.0)
+    return float(np.sqrt(s2))
 
 
 def emva_extras_core(
@@ -455,7 +503,7 @@ def emva_extras_core(
         ok = [rs for rs in rows if rs[1]["mean"] < CLIP_DN]
     if not ok:
         return None
-    mu_sat = max(s["mean"] for _, s in ok)
+    mu_sat = flat["mu_sat_dn"]  # same saturation point that bounds the PTC fit
     k12 = flat["K12"]
     bias = dk["bias_dn"]
     nsat = (mu_sat - bias) * k12 / 16.0
@@ -464,7 +512,7 @@ def emva_extras_core(
     mu_min = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * sig**2))  # SNR = 1 point
     dr = nsat / mu_min  # Eq. 28
 
-    s2_dark = max(float(highpass(d_img).var()) - dark_tvar_short / dark_L, 0.0)
+    s2_dark = dsnu1288_core(d_img, dark_tvar_short, dark_L) ** 2
     s2_50 = max(
         float(highpass(f_img - d_img).var())
         - flat_tvar_50 / flat_L
@@ -496,13 +544,20 @@ def emva1288_extras(dark_seq, flat_seq, dk, flat):
     would give e- via K); the threshold/DR are in electrons via the PTC gain
     (Eq. 66 needs no calibrated photodiode, only photon units do).
     """
-    print("\n=== EMVA 1288 R4 Linear (saturation, nonuniformity, DR) ===")
+    typer.secho(
+        "\n=== EMVA 1288 R4 Linear (saturation, nonuniformity, DR) ===",
+        bold=True,
+        fg=typer.colors.CYAN,
+    )
     rows = flat["rows"]
     ok = [rs for rs in rows if rs[1]["sat_frac"] <= SAT_CLIP_FRAC]
     if not ok:
-        print("  ! no point under the clip-fraction limit -- using max unclipped")
+        typer.secho(
+            "  ! no point under the clip-fraction limit -- using max unclipped",
+            fg=typer.colors.YELLOW,
+        )
     if not ok and not [rs for rs in rows if rs[1]["mean"] < CLIP_DN]:
-        print("  ! no usable points")
+        typer.secho("  ! no usable points", fg=typer.colors.YELLOW)
         return
 
     d_stack = min(dark_seq, key=lambda es: es[0])[1]
@@ -528,23 +583,23 @@ def emva1288_extras(dark_seq, flat_seq, dk, flat):
     )
     if x is None:
         return
-    print(
+    typer.echo(
         f"  mu_y.sat    = {x['mu_sat_dn']:.0f} DN16  "
         f"(<= {SAT_CLIP_FRAC * 100:.1f}% of pixels at {SAT_MAX_DN:.0f})"
     )
-    print(
+    typer.echo(
         f"  Nsat (EMVA) = {x['nsat_e']:.0f} e-  (bias-subtracted; "
         f"vs K*4094 = {flat['Nsat']:.0f} e-)"
     )
-    print(
+    typer.echo(
         f"  mu_e.min    = {x['mu_min_e']:.1f} e- (SNR = 1);  "
         f"DR = {x['dr']:.0f} (Eq. 28)  ({x['dr_db']:.1f} dB)"
     )
-    print(
+    typer.echo(
         f"  PRNU1288    = {x['prnu1288_pct']:.2f} %  "
         f"(highpass, {f_exp * 1000:.1f} ms ~ 50% sat)"
     )
-    print(f"  DSNU1288    = {x['dsnu1288_dn']:.2f} DN16 (highpass dark image)")
+    typer.echo(f"  DSNU1288    = {x['dsnu1288_dn']:.2f} DN16 (highpass dark image)")
 
 
 def run(data_dir, roi=None, bands=5):
@@ -563,9 +618,11 @@ def run(data_dir, roi=None, bands=5):
     roi = roi or DEFAULT_ROI
     ROI = tuple(slice(a, b) for a, b in zip(roi[0::2], roi[1::2]))
 
-    print(
+    typer.secho(
         f"Analyzing {cam_dir.resolve()}  (ROI rows {roi[0]}:{roi[1]}, "
-        f"cols {roi[2]}:{roi[3]})"
+        f"cols {roi[2]}:{roi[3]})",
+        bold=True,
+        fg=typer.colors.CYAN,
     )
     dark_seq = load_sequence(cam_dir, "dark")
     dk = analyze_dark(dark_seq)
@@ -573,21 +630,24 @@ def run(data_dir, roi=None, bands=5):
         camera = load_camera_info(cam_dir)
         meta = load_camera_meta(cam_dir)
         out_dir = Path("outputs") / (camera_dir_name(meta) if meta else cam_dir.name)
-        print(f"\n  bias floor (shortest exp): {dk['bias_dn']:.2f} DN16")
-        print(
+        typer.echo(f"\n  bias floor (shortest exp): {dk['bias_dn']:.2f} DN16")
+        typer.echo(
             f"  dark current (mean, Eq. 29): {dk['dark_current_dn_per_s']:.4f} DN16/s"
         )
-        print(
+        typer.echo(
             f"  dark current (var, Eq. 30): "
             f"{dk['dark_current_var_dn2_per_s']:.2f} DN16^2/s "
             f"(slope inflated by DCNU/drift vs the mean)"
         )
-        print(
+        typer.echo(
             f"  read noise (Eq. 30 fit offset): {dk['sigma_r_dn']:.2f} DN16 "
             f"(short-exposure median {dk['sigma_r_median_dn']:.2f})"
         )
-        save_dark_plot(dk["rows"], out_dir, roi, camera)
-        save_dark_variance_plot(dk["rows"], out_dir, roi, camera)
+        save_dark_mean_plot(dk["rows"], out_dir, roi, camera)
+        d_stack = min(dark_seq, key=lambda es: es[0])[1]
+        d_img = d_stack[:, ROI[0], ROI[1]].astype(np.float64).mean(axis=0)
+        dsnu = dsnu1288_core(d_img, dk["rows"][0][1]["tvar"], d_stack.shape[0])
+        save_dark_variance_plot(dk["rows"], out_dir, roi, camera, dsnu=dsnu)
         flat_seq = load_sequence(cam_dir, "flat")
         flat = analyze_flats(flat_seq, dk)
         if flat:

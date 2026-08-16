@@ -17,10 +17,10 @@ uv run camchar warmup-sensor
 
 # dark frames: lens cap ON, dark room
 uv run camchar get-dark-frames \
-    --exposures 0.001,0.01,0.1,0.5,2.0 --frames 20 --gain 0
+    --exposures 1,10,100,500,2000 --frames 20 --gain 0
 # flat frames: uniform broadband illumination (halogen + diffuser, or LED flat panel)
 uv run camchar get-flat-frames \
-    --exposures 0.01,0.05,0.1,0.5 --frames 20 --gain 0 \
+    --exposures 10,50,100,500 --frames 20 --gain 0 \
     --notes "green LED ~530nm, diffuser, 30 cm"
 
 # analysis: temporal PTC -> K, read noise, Nsat, dark current, PRNU, linearity
@@ -42,19 +42,28 @@ Sub-ms / fractional-ms exposures use microsecond names (e.g. `flat_004500us`).
 ## CLI
 
 ```
-camchar get-dark-frames [--out ROOT] [--exposures S,S,...] [--frames N] [--gain G] [--notes TXT]
-camchar get-flat-frames [--out ROOT] [--exposures S,S,...] [--frames N] [--gain G] [--notes TXT]
+camchar get-dark-frames [--out ROOT] [--exposures MS,MS,...] [--frames N] [--gain G] [--notes TXT]
+camchar get-flat-frames [--out ROOT] [--exposures MS,MS,...] [--frames N] [--gain G] [--notes TXT]
 camchar analyze --data DIR [--roi r0:r1:c0:c1] [--bands N]
 camchar warmup-sensor
+camchar source-stability-check [--exposures MS,MS,...] [--frames N] [--gain G]
 ```
 
-Defaults: dark 0.001–2.0 s (9 points), flat 0.01–1.0 s (5 points), 20 frames each, gain 0.
+Exposure times are given in milliseconds (fractional values allowed). Defaults: dark
+and flat share 50 log-spaced exposures from 0.1–1000 ms (np.logspace), 10 frames each,
+gain 0.
 `--out` defaults to `data`; frames are written to
 `<out>/<vendor>_<model>_(<sensor>)/dark|flat/`.
 `warmup-sensor` runs continuous 0.1 s exposures and prints the timestamped sensor
 temperature; it declares the temperature stable once it stays within 0.3 °C over the
 last 2 min and auto-stops 1 min after that (Ctrl+C to stop earlier). Run it before
 acquiring so darks/flats are taken at thermal equilibrium.
+`source-stability-check` captures 4 consecutive frames at each exposure (default
+0.01/0.1/1/10/100/1000 ms, spanning the camera's 10 µs–1 s default sweep) and prints the percent deviation of each frame's spatial mean versus
+the first frame (the reference); any deviation above 0.1% triggers a per-exposure
+warning and exit code 1. Run it on the flat-field source before acquisition —
+different exposures probe different fluctuation timescales (short exposures see
+fast ripple, long exposures catch slow drift).
 `analyze` accepts the data root (`data`) or a camera dir directly
 (`data/playerone_Apollo-M_(IMX174)`); a single camera dir under the root is
 auto-discovered. It reads `<camera>/dark/` + `<camera>/flat/` from metadata.json,
@@ -65,7 +74,7 @@ EMVA-style saturation / absolute sensitivity threshold / dynamic range, and
 highpass-filtered PRNU1288/DSNU1288 (EMVA 1288 §8.1), and writes plots
 (dark mean + dark variance vs exposure, linearity, PTC, SNR) to
 `outputs/<vendor>_<model>_(<sensor>)/`. ROI defaults
-to a central 200×200 patch (600:800:850:1050); only the ROI needs uniform
+to a central 400×400 patch (500:900:750:1150); only the ROI needs uniform
 illumination.
 Every quantity is cross-checked with the **EMVA 1288 Release 4 two-frame method**
 (Eq. 18 temporal variance with common-mode correction, Eq. 32 spatial covariance,
@@ -102,7 +111,8 @@ uv run camchar analyze --data data/SPECIM_IQ --bands 7  # 7 curves per plot
   ddof conventions, two-frame cross-checks). PTC-fit points must pass the
   EMVA §6.6 saturation test (≤0.2% clipped pixels) — not just the mean
   clip threshold, since heavily pinned pixels lose their variance and bend
-  the fit. Bands with <3 usable flat points (dim UV end, saturated bands)
+  the fit — and lie within the R4 Linear regression range (minimum value to
+  70% of the measured saturation). Bands with <3 usable flat points (dim UV end, saturated bands)
   are `skipped`; bands whose V-vs-S slope comes out non-positive
   (between-acquisition drift is the usual cause — each acquisition is a
   separate recording) are flagged `degenerate PTC` and their two-frame K is

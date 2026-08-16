@@ -8,8 +8,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import typer
 
-_DEFAULT_ROI = (600, 800, 850, 1050)
+_DEFAULT_ROI = (500, 900, 750, 1150)
 _DEFAULT_ROI_SPECIM = (156, 356, 156, 356)
 
 
@@ -17,7 +18,9 @@ def _title_with_camera(base, camera, roi):
     title = base
     if camera:
         title += "\n" + camera
-    if roi and tuple(roi) in (_DEFAULT_ROI, _DEFAULT_ROI_SPECIM):
+    if roi and tuple(roi) == _DEFAULT_ROI:
+        title += " (central 400x400 px ROI)"
+    elif roi and tuple(roi) == _DEFAULT_ROI_SPECIM:
         title += " (central 200x200 px ROI)"
     elif roi:
         title += f" (ROI rows {roi[0]}:{roi[1]}, cols {roi[2]}:{roi[3]})"
@@ -29,7 +32,7 @@ def _band_colors(n):
     return plt.cm.viridis(np.linspace(0.0, 0.9, max(n, 1)))
 
 
-def save_dark_plot(rows, out_dir, roi=None, camera=None):
+def save_dark_mean_plot(rows, out_dir, roi=None, camera=None):
     """Mean dark DN vs exposure with the dark-current linear fit.
 
     rows is the 'rows' list from analyze_dark: (exposure_s, stats) with
@@ -38,7 +41,9 @@ def save_dark_plot(rows, out_dir, roi=None, camera=None):
     x = np.array([e for e, _ in rows]) * 1000
     y = np.array([s["mean"] for _, s in rows])
     if len(x) < 2:
-        print("  ! too few dark points for dark plot")
+        typer.secho(
+            "  ! too few dark points for dark mean plot", fg=typer.colors.YELLOW
+        )
         return None
     slope, intercept = np.polyfit(x, y, 1)
     yhat = np.polyval([slope, intercept], x)
@@ -47,7 +52,7 @@ def save_dark_plot(rows, out_dir, roi=None, camera=None):
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(x, y, "o", ms=5, label="dark (measured)")
+    ax.semilogx(x, y, "o", ms=5, label="dark (measured)")
     x_line = np.linspace(x.min(), x.max(), 200)
     ax.plot(
         x_line,
@@ -70,6 +75,8 @@ def save_dark_plot(rows, out_dir, roi=None, camera=None):
         0.97,
         rf"$\mu_{{y,\mathrm{{dark}}}} = {slope:.4g}\,t {intercept:+.2f}$ (DN16)"
         "\n"
+        f"bias offset = {intercept:.2f} DN16"
+        "\n"
         f"R² = {r2:.6f}"
         "\n"
         rf"$\mu_{{I,y}} = {slope * 1000:.4f}$ DN16/s",
@@ -84,24 +91,27 @@ def save_dark_plot(rows, out_dir, roi=None, camera=None):
     path = out_path / "dark_mean_vs_exposure.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [plot] saved {path}")
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
     return {"slope": slope, "intercept": intercept, "r2": r2}
 
 
-def save_dark_variance_plot(rows, out_dir, roi=None, camera=None):
+def save_dark_variance_plot(rows, out_dir, roi=None, camera=None, dsnu=None):
     """Dark temporal variance vs exposure with the Eq. 30 fit.
 
     rows is the 'rows' list from analyze_dark: (exposure_s, stats) with
     stats['tvar']/stats['tf_tvar']. The N-frame fit's slope is the
     variance-based dark-current estimate and its offset is sigma_r^2
     (EMVA R4 Linear Eq. 30); the two-frame values are the cross-check.
-    Saves dark_variance_vs_exposure.png.
+    dsnu is DSNU1288 (Eq. 66, DN16) from the shortest dark stack, shown in
+    the text box when provided. Saves dark_variance_vs_exposure.png.
     """
     x = np.array([e for e, _ in rows]) * 1000
     y = np.array([s["tvar"] for _, s in rows])
     y_tf = np.array([s["tf_tvar"] for _, s in rows])
     if len(x) < 2:
-        print("  ! too few dark points for dark variance plot")
+        typer.secho(
+            "  ! too few dark points for dark variance plot", fg=typer.colors.YELLOW
+        )
         return None
     slope, offset = np.polyfit(x, y, 1)
     slope_tf, offset_tf = np.polyfit(x, y_tf, 1)
@@ -128,6 +138,7 @@ def save_dark_variance_plot(rows, out_dir, roi=None, camera=None):
         lw=1.5,
         label="Eq. 30 fit (two-frame)",
     )
+    ax.set_xscale("log")
     ax.set_xlabel(r"$t_{\mathrm{exp}}$ (ms)")
     ax.set_ylabel(r"$\sigma_{y,\mathrm{dark}}^2$ (DN16²)")
     ax.set_title(
@@ -139,9 +150,7 @@ def save_dark_variance_plot(rows, out_dir, roi=None, camera=None):
     )
     ax.legend(loc="lower right")
     ax.grid(alpha=0.3)
-    ax.text(
-        0.03,
-        0.97,
+    text = (
         rf"$\sigma_y^2 = {slope:.4g}\,t {offset:+.2f}$ (DN16²)"
         "\n"
         f"R² = {r2:.6f}"
@@ -149,7 +158,14 @@ def save_dark_variance_plot(rows, out_dir, roi=None, camera=None):
         rf"$\mu_{{I,y}} = {slope * 1000:.4f}$ DN16²/s (Eq. 30 slope)"
         "\n"
         rf"$\sigma_r = \sqrt{{\max(\mathrm{{offset}}, 0)}} = "
-        rf"{np.sqrt(max(offset, 0.0)):.2f}$ DN16",
+        rf"{np.sqrt(max(offset, 0.0)):.2f}$ DN16"
+    )
+    if dsnu is not None:
+        text += "\n" + f"DSNU1288 = {dsnu:.2f} DN16"
+    ax.text(
+        0.03,
+        0.97,
+        text,
         transform=ax.transAxes,
         va="top",
         fontsize=10,
@@ -161,7 +177,7 @@ def save_dark_variance_plot(rows, out_dir, roi=None, camera=None):
     path = out_path / "dark_variance_vs_exposure.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [plot] saved {path}")
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
     return {"slope": slope, "offset": offset, "r2": r2}
 
 
@@ -176,7 +192,9 @@ def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
     y = np.array([s["mean"] for _, s in rows])
     fit_mask = y < clip_dn
     if fit_mask.sum() < 2:
-        print("  ! too few unclipped points for linearity plot")
+        typer.secho(
+            "  ! too few unclipped points for linearity plot", fg=typer.colors.YELLOW
+        )
         return None
 
     xf, yf = x[fit_mask], y[fit_mask] - bias_dn
@@ -209,13 +227,14 @@ def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
     ax.legend(loc="lower right")
     ax.grid(alpha=0.3)
     ax.text(
-        0.03,
         0.97,
+        0.5,
         rf"$\mu_y - \mu_{{y,\mathrm{{dark}}}} = {slope:.2f}\,t {intercept:+.2f}$ (DN16)"
         "\n"
         f"R² = {r2:.6f}",
         transform=ax.transAxes,
-        va="top",
+        va="center",
+        ha="right",
         fontsize=10,
         bbox=dict(boxstyle="round", fc="white", alpha=0.85),
     )
@@ -225,7 +244,7 @@ def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
     path = out_path / "linearity_mean_vs_exposure.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [plot] saved {path}")
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
     return {"slope": slope, "intercept": intercept, "r2": r2}
 
 
@@ -255,12 +274,24 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
 
     fx = np.array([s["mean"] for _, s in flat["rows"]])
     fv = np.array([s["tvar"] for _, s in flat["rows"]])
-    fit_mask = (fx < clip_dn) & (fv > 0)
+    cap = flat["ptc_sat_70_dn"]
+    fit_mask = (fx <= cap) & (fx < clip_dn) & (fv > 0)
     if fit_mask.sum() < 2:
-        print("  ! too few points for PTC plot")
+        typer.secho("  ! too few points for PTC plot", fg=typer.colors.YELLOW)
         plt.close(fig)
         return None
-    ax.loglog(fx[fit_mask], fv[fit_mask], "o", ms=5, label="flat (unclipped)")
+    ax.loglog(fx[fit_mask], fv[fit_mask], "o", ms=5, label="flat (fit, 0-70% sat)")
+    above = (fx > cap) & (fx < clip_dn) & (fv > 0)
+    if above.any():
+        ax.loglog(
+            fx[above],
+            fv[above],
+            "x",
+            ms=6,
+            color="0.5",
+            alpha=0.8,
+            label="excluded (>70% sat)",
+        )
 
     x_line = np.linspace(fx[fit_mask].min(), fx[fit_mask].max(), 200)
     ax.loglog(
@@ -279,6 +310,21 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
         lw=1.2,
         label=rf"$\sigma_r^2$ read-noise floor = {sigma_r2:.1f} DN16²",
     )
+    ax.axvline(
+        2**16,
+        ls="--",
+        color="tab:red",
+        lw=1.2,
+        label="2¹⁶ max DN16",
+    )
+    if flat["ptc_capped"]:
+        ax.axvline(
+            cap,
+            ls="--",
+            color="tab:orange",
+            lw=1.2,
+            label=rf"0.7·$\mu_{{s}}$ = {cap:.0f} DN16",
+        )
 
     ax.set_xlabel(r"$\mu_y$ (DN16)")
     ax.set_ylabel(r"$\sigma_y^2$ (DN16²)")
@@ -312,7 +358,7 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
     path = out_path / "ptc_variance_vs_mean.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [plot] saved {path}")
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
     return None
 
 
@@ -329,7 +375,7 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
     tvars = np.array([s["tvar"] for _, s in flat["rows"]])
     m = (means < clip_dn) & (tvars > 0)
     if m.sum() < 2:
-        print("  ! too few points for SNR plot")
+        typer.secho("  ! too few points for SNR plot", fg=typer.colors.YELLOW)
         return None
     k12 = flat["K12"]
     signal = (means[m] - flat["bias_dn"]) * k12 / 16.0
@@ -378,7 +424,7 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
     path = out_path / "snr_vs_signal.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [plot] saved {path}")
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
     return None
 
 
@@ -414,7 +460,9 @@ def save_dark_plot_bands(sel_results, out_dir, roi=None, camera=None):
         )
         drew = True
     if not drew:
-        print("  ! too few dark points for per-band dark plot")
+        typer.secho(
+            "  ! too few dark points for per-band dark plot", fg=typer.colors.YELLOW
+        )
         plt.close(fig)
         return None
     ax.set_xlabel(r"$t_{\mathrm{exp}}$ (ms)")
@@ -433,7 +481,7 @@ def save_dark_plot_bands(sel_results, out_dir, roi=None, camera=None):
     path = out_path / "dark_mean_vs_exposure_bands.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [plot] saved {path}")
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
     return None
 
 
@@ -468,7 +516,10 @@ def save_dark_variance_plot_bands(sel_results, out_dir, roi=None, camera=None):
         )
         drew = True
     if not drew:
-        print("  ! too few dark points for per-band dark variance plot")
+        typer.secho(
+            "  ! too few dark points for per-band dark variance plot",
+            fg=typer.colors.YELLOW,
+        )
         plt.close(fig)
         return None
     ax.set_xlabel(r"$t_{\mathrm{exp}}$ (ms)")
@@ -488,7 +539,7 @@ def save_dark_variance_plot_bands(sel_results, out_dir, roi=None, camera=None):
     path = out_path / "dark_variance_vs_exposure_bands.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [plot] saved {path}")
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
     return None
 
 
@@ -524,7 +575,10 @@ def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=No
             ax.loglog(x[~m], np.maximum(y[~m], 1.0), "x", ms=7, color=color, alpha=0.7)
         drew = True
     if not drew:
-        print("  ! too few unclipped points for per-band linearity plot")
+        typer.secho(
+            "  ! too few unclipped points for per-band linearity plot",
+            fg=typer.colors.YELLOW,
+        )
         plt.close(fig)
         return None
     ax.set_xlabel(r"$t_{\mathrm{exp}}$ (ms)")
@@ -544,7 +598,7 @@ def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=No
     path = out_path / "linearity_mean_vs_exposure_bands.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [plot] saved {path}")
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
     return None
 
 
@@ -561,7 +615,8 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
             continue
         x = np.array([s["mean"] for _, s in f["rows"]])
         v = np.array([s["tvar"] for _, s in f["rows"]])
-        m = (x < clip_dn) & (v > 0)
+        cap = f["ptc_sat_70_dn"]
+        m = (x <= cap) & (x < clip_dn) & (v > 0)
         if m.sum() < 2:
             continue
         ax.loglog(
@@ -572,6 +627,9 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
             color=color,
             label=rf"$\lambda$ {r['wl_nm']:.0f} nm: K={f['K12']:.2f}",
         )
+        ab = (x > cap) & (x < clip_dn) & (v > 0)
+        if ab.any():
+            ax.loglog(x[ab], v[ab], "x", ms=4, color="0.5", alpha=0.7)
         xl = np.linspace(x[m].min(), x[m].max(), 100)
         ax.loglog(
             xl,
@@ -582,7 +640,7 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         )
         drew = True
     if not drew:
-        print("  ! too few points for per-band PTC plot")
+        typer.secho("  ! too few points for per-band PTC plot", fg=typer.colors.YELLOW)
         plt.close(fig)
         return None
     ax.set_xlabel(r"$\mu_y$ (DN16)")
@@ -602,7 +660,7 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
     path = out_path / "ptc_variance_vs_mean_bands.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [plot] saved {path}")
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
     return None
 
 
@@ -635,7 +693,7 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         sig_hi.append(signal.max())
         drew = True
     if not drew:
-        print("  ! too few points for per-band SNR plot")
+        typer.secho("  ! too few points for per-band SNR plot", fg=typer.colors.YELLOW)
         plt.close(fig)
         return None
     si = np.linspace(min(sig_lo), max(sig_hi), 200)
@@ -658,7 +716,7 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
     path = out_path / "snr_vs_signal_bands.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [plot] saved {path}")
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
     return None
 
 
@@ -737,5 +795,5 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
     path = out_path / "band_parameters_vs_wavelength.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  [plot] saved {path}")
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
     return None
