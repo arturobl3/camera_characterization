@@ -75,6 +75,16 @@ class TestFitDarkStats:
         assert dk["dark_current_var_dn2_per_s"] == pytest.approx(0.0, abs=1e-9)
         assert dk["sigma_r_dn"] == pytest.approx(np.sqrt(159.0))
 
+    def test_sigma_r_from_two_frame(self):
+        """N-frame variance inflated by drift: sigma_r tracks tf_tvar."""
+        rows = dark_rows()
+        for _, s in rows:
+            s["tf_tvar"] = s["tvar"]
+            s["tvar"] += 20.0
+        dk = A.fit_dark_stats(rows)
+        assert dk["sigma_r_dn"] ** 2 == pytest.approx(158.72, abs=0.2)
+        assert dk["sigma_r_nf_dn"] ** 2 == pytest.approx(178.72, abs=0.05)
+
 
 class TestFitFlatStats:
     def test_exact_data_recovers_k(self):
@@ -85,9 +95,9 @@ class TestFitFlatStats:
         assert flat["ptc_intercept"] == 0.0  # Eq. 50 zero-intercept by construction
         assert flat["ptc_intercept_free"] == pytest.approx(0.0, abs=1e-6)
         assert flat["ptc_r2"] == pytest.approx(1.0)
-        assert flat["K12_tf"] == pytest.approx(8.0)
+        assert flat["K12_nf"] == pytest.approx(8.0)
         assert flat["Nsat"] == pytest.approx(8.0 * 4094)
-        # dV aligned with rows: dV[i] = tvar[i] - dark_tvar(exp_i)
+        # dV aligned with rows: dV[i] = tf_tvar[i] - dark_tf_tvar(exp_i)
         assert flat["dV"][0] == pytest.approx(2.0 * 100.0)
         assert flat["dV"][2] == pytest.approx(2.0 * 300.0)
 
@@ -131,7 +141,20 @@ class TestFitFlatStats:
         rows = flat_rows(n=5)
         for _, s in rows:
             s["tvar"] = 1.0  # lens-cap-on scenario
+            s["tf_tvar"] = 1.0
         assert A.fit_flat_stats(rows, dark_fit(dark_flat())) is None
+
+    def test_two_frame_primary_nf_crosscheck(self):
+        """Drift inflates the N-frame variance; K12 must track tf_tvar."""
+        rows = flat_rows(k_slope=2.0)
+        for _, s in rows:
+            s["tf_tvar"] = s["tvar"]  # two-frame: clean, K slope 2.0
+            s["tvar"] = 159.0 + 2.2 * (s["mean"] - 165.0)  # N-frame: K slope 2.2
+        flat = A.fit_flat_stats(rows, dark_fit(dark_flat()))
+        assert flat is not None
+        assert flat["K12"] == pytest.approx(8.0)  # 16/2.0 (two-frame primary)
+        assert flat["K12_nf"] == pytest.approx(16.0 / 2.2, rel=1e-9)
+        assert flat["dV"][0] == pytest.approx(2.0 * 100.0)  # dV is two-frame
 
     def test_dark_var_extrapolated_outside_grid(self):
         # flat exposures (1..10 s) beyond the dark grid (max 0.1 s): the

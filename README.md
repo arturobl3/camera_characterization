@@ -80,12 +80,13 @@ EMVA Eq. 69 total-SNR curve and measured points including DSNU1288/PRNU1288) to
 `outputs/<vendor>_<model>_(<sensor>)/`. ROI defaults
 to a central 400×400 patch (500:900:750:1150); only the ROI needs uniform
 illumination.
-Every quantity is cross-checked with the **EMVA 1288 Release 4 two-frame method**
-(Eq. 18 temporal variance with common-mode correction, Eq. 32 spatial covariance,
-averaged over consecutive pairs) — see the `tf`/`tfs` columns and the
-K/σr/PRNU (tf) lines. N-frame and two-frame values must agree to <~1%; a
-systematic gap signals estimator bias or source non-stationarity. Temporal
-variance uses ddof=1 (EMVA R4 Linear Eq. 65): the ddof=0 population estimator is biased
+The **EMVA 1288 Release 4 two-frame method is the primary estimator** (Eq. 18
+temporal variance with common-mode correction, Eq. 32 spatial covariance,
+averaged over consecutive pairs): adjacent-pair differences reject
+between-acquisition drift, so K/σr/dV/PRNU all come from it. The N-frame
+values are the cross-check (`nf` columns and lines) and must agree to <~1%
+for a stationary source; a systematic gap signals drift between
+acquisitions. Temporal variance uses ddof=1 (EMVA R4 Linear Eq. 65): the ddof=0 population estimator is biased
 low by (N−1)/N (5% at N=20) — this exact bug was caught by the two-frame
 cross-check in the Aug 2026 Apollo-M dataset (K 8.91 → 8.46 e⁻/DN12).
 
@@ -118,9 +119,10 @@ uv run camchar analyze --data data/SPECIM_IQ --bands 7  # 7 curves per plot
   the fit — and lie within the R4 Linear regression range (minimum value to
   70% of the measured saturation). Bands with <3 usable flat points (dim UV end, saturated bands)
   are `skipped`; bands whose V-vs-S slope comes out non-positive
-  (between-acquisition drift is the usual cause — each acquisition is a
-  separate recording) are flagged `degenerate PTC` and their two-frame K is
-  the robust estimate.
+  (saturation-collapsed variance and/or per-acquisition shutter/lamp jumps —
+  with the two-frame primary the between-acquisition drift that used to bend
+  the N-frame variance no longer affects the fit) are flagged `degenerate PTC`.
+  A systematic two-frame-vs-N-frame K gap is the drift indicator.
 - **Output**: one-line-per-band table, an EMVA detail block per plotted
   band, `outputs/SPECIM_IQ/band_parameters.csv` (every parameter × 204
   bands), the same plot set as the monochrome path with one curve per
