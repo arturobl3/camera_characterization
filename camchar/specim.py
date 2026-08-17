@@ -21,6 +21,7 @@ storage the playerone pipeline uses), so every downstream constant
 unchanged.
 """
 
+import mmap
 import re
 from pathlib import Path
 
@@ -73,13 +74,38 @@ def iter_cubes(exp_dir):
 
 
 def open_cube(hdr_path):
-    """envi image for a capture header (data file is the sibling .raw)."""
+    """envi image for a capture header (data file is the sibling .raw).
+
+    Used for .hdr metadata only -- pixels are read via read_roi_bil(), not
+    spectral's read_subimage() (which does one seek+2-byte-read per pixel:
+    ~4 s for a 200x200x204 ROI, vs ~10 ms for the mmap path).
+    """
     return envi.open(str(hdr_path), str(hdr_path.with_suffix(".raw")))
 
 
 def wavelengths_of(img):
     wl = img.metadata.get("wavelength") or []
     return np.array([float(w) for w in wl])
+
+
+def read_roi_bil(raw_path, n_lines, n_samples, n_bands, r0, r1, c0, c1, offset=0):
+    """ROI slice of a BIL uint16 ENVI cube as a C-contiguous (R, C, B) array.
+
+    BIL layout is (lines, bands, samples) on disk, so the file is mapped to
+    an ndarray of that shape and the ROI rows/cols are taken with one strided
+    slice. Byte-identical to spectral's BilFile.read_subimage output (which
+    is pathological here: a per-pixel seek/fromfile loop).
+    """
+    with open(raw_path, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            cube = np.ndarray(
+                (n_lines, n_bands, n_samples), dtype=np.uint16, buffer=mm, offset=offset
+            )
+            out = np.ascontiguousarray(cube[r0:r1, :, c0:c1].transpose(0, 2, 1))
+        finally:
+            mm.close()
+    return out
 
 
 def load_exposure_stack(exp_dir, exp_s, r0, r1, c0, c1):
@@ -93,10 +119,12 @@ def load_exposure_stack(exp_dir, exp_s, r0, r1, c0, c1):
         print(f"  ! no capture cubes in {exp_dir}")
         return None, None
 
-    imgs, n_bands = [], None
+    metas, n_bands = [], None
     for h in hdrs:
-        img = open_cube(h)
-        tint = img.metadata.get("tint")
+        img = open_cube(h)  # header metadata only; pixels come via read_roi_bil
+        meta = img.metadata
+        img.fid.close()
+        tint = meta.get("tint")
         if tint is not None:
             try:
                 tint_ms = float(tint)
@@ -112,19 +140,30 @@ def load_exposure_stack(exp_dir, exp_s, r0, r1, c0, c1):
         elif int(img.shape[2]) != n_bands:
             print(f"  ! {h.stem}: {img.shape[2]} bands != {n_bands}, skipping cube")
             continue
-        imgs.append(img)
-    if not imgs:
+        metas.append((h, img))
+    if not metas:
         return None, None
 
-    wl = wavelengths_of(imgs[0])
+    wl = wavelengths_of(metas[0][1])
     if len(wl) != n_bands:
         print(f"  ! wavelength list has {len(wl)} entries != {n_bands} bands")
         return None, None
 
-    rows, cols = list(range(r0, r1)), list(range(c0, c1))
-    out = np.empty((len(imgs), r1 - r0, c1 - c0, n_bands), dtype=np.uint16)
-    for i, img in enumerate(imgs):
-        cube = np.array(img.read_subimage(rows, cols))  # copy: view is read-only
+    out = np.empty((len(metas), r1 - r0, c1 - c0, n_bands), dtype=np.uint16)
+    for i, (h, img) in enumerate(metas):
+        cube = read_roi_bil(
+            h.with_suffix(".raw"),
+            img.shape[0],
+            img.shape[1],
+            n_bands,
+            r0,
+            r1,
+            c0,
+            c1,
+            offset=int(img.offset),
+        )
+        if img.scale_factor != 1.0:
+            cube = cube / float(img.scale_factor)  # mirrors read_subimage
         if int(cube.max()) > RAW_MAX_DN:
             print(
                 f"  ! cube {i}: max DN {int(cube.max())} > {RAW_MAX_DN} "

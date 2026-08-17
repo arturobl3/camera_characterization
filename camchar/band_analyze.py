@@ -22,10 +22,10 @@ from . import analyze
 from . import specim
 from .analyze import (
     CLIP_DN,
+    SAT_MAX_DN,
     emva_extras_core,
     fit_dark_stats,
     fit_flat_stats,
-    roi_stats,
 )
 from .plots import (
     save_band_parameters_plot,
@@ -36,8 +36,50 @@ from .plots import (
     save_snr_plot_bands,
 )
 
-_FULL = (slice(None), slice(None))  # stacks arrive already ROI-cropped
 _CAMERA_LABEL = "SPECIM IQ"
+
+
+def _band_roi_stats(stack, n_bands):
+    """roi_stats dicts for every band at once (one float64 conversion).
+
+    Same estimators as analyze.roi_stats -- N-frame temporal variance with
+    ddof=1, spatial variance with ddof=0, EMVA R4 Linear two-frame Eqs. 18/32
+    with their pair-to-pair scatter, and the 6.6 saturation fraction --
+    batched over the band axis so the stack is converted to float64 once
+    instead of 2*B times (roi_stats and two_frame_stats each re-convert the
+    stack per band). Stacks arrive already ROI-cropped.
+    """
+    f = stack.astype(np.float64)
+    means = f.mean(axis=(0, 1, 2))
+    tvars = f.var(axis=0, ddof=1).mean(axis=(0, 1))
+    svars = f.var(axis=1).mean(axis=(0, 1))
+    sat = (f >= SAT_MAX_DN).mean(axis=(0, 1, 2))
+    n_pairs = f.shape[0] // 2
+    if n_pairs >= 1:
+        a = f[0 : 2 * n_pairs : 2]
+        b = f[1 : 2 * n_pairs : 2]
+        mu_a = a.mean(axis=(1, 2))
+        mu_b = b.mean(axis=(1, 2))
+        d = a - b
+        pair_t = 0.5 * (d * d).mean(axis=(1, 2)) - 0.5 * (mu_a - mu_b) ** 2
+        pair_s = (a * b).mean(axis=(1, 2)) - mu_a * mu_b
+        tf_t, tf_s = pair_t.mean(axis=0), pair_s.mean(axis=0)
+        tf_ts, tf_ss = pair_t.std(axis=0), pair_s.std(axis=0)
+    else:
+        tf_t = tf_s = tf_ts = tf_ss = np.zeros(n_bands)
+    return [
+        {
+            "mean": float(means[b]),
+            "tvar": float(tvars[b]),
+            "svar": float(svars[b]),
+            "tf_tvar": float(tf_t[b]),
+            "tf_svar": float(tf_s[b]),
+            "tf_tvar_scatter": float(tf_ts[b]),
+            "tf_svar_scatter": float(tf_ss[b]),
+            "sat_frac": float(sat[b]),
+        }
+        for b in range(n_bands)
+    ]
 
 
 def _load_kind_stats(exps, kind, r0, r1, c0, c1):
@@ -61,7 +103,7 @@ def _load_kind_stats(exps, kind, r0, r1, c0, c1):
             f"  [{kind}] {exp_s * 1000:7.1f} ms: {n} cubes x {n_bands} bands "
             f"(DN16, ROI-cropped)"
         )
-        stats[exp_s] = [roi_stats(stack[:, :, :, b], _FULL) for b in range(n_bands)]
+        stats[exp_s] = _band_roi_stats(stack, n_bands)
         means[exp_s] = stack.mean(axis=0, dtype=np.float32)
         counts[exp_s] = n
         del stack
