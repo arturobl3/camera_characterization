@@ -362,7 +362,11 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
     quantization included): the model curve plus the measured total SNR at
     each exposure step. Saves snr_vs_signal.png.
     """
-    from .analyze import snr_temporal_model, snr_total_measured, snr_total_model  # local: import cycle
+    from .analyze import (  # local: import cycle
+        snr_temporal_model,
+        snr_total_measured,
+        snr_total_model,
+    )
 
     extras = flat.get("extras")
     means = np.array([s["mean"] for _, s in flat["rows"]])
@@ -1003,12 +1007,17 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
 
 
 def save_band_parameters_plot(results, selected, out_dir, camera=None):
-    """EMVA parameters vs wavelength: K, sigma_r, dark current, PRNU/DSNU.
+    """EMVA parameters vs wavelength: K, peak SNR, dark current, PRNU/DSNU.
 
     All bands are plotted; the bands chosen for the per-band plots are marked
-    with vertical dotted lines. Saves band_parameters_vs_wavelength.png.
+    with vertical dotted lines. Every panel carries a text box with the mean
+    over the plotted (non-degenerate) bands, plus dashed horizontal lines at
+    the all-band and 500-800 nm means. The nonuniformity panel plots the
+    all-band and 500-800 nm subsets of both PRNU and DSNU. Saves
+    band_parameters_vs_wavelength.png.
     """
     wl = np.array([r["wl_nm"] for r in results])
+    mid = (wl >= 500.0) & (wl <= 800.0)  # 500-800 nm subset for the second mean line
     fig, axes = plt.subplots(2, 2, figsize=(12, 9))
     sel_wl = [results[b]["wl_nm"] for b in selected]
 
@@ -1020,6 +1029,45 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
         for w in sel_wl:
             ax.axvline(w, color="0.5", ls=":", lw=1, alpha=0.7)
 
+    def _sub(a, mask):
+        """Restrict a value array to the 500-800 nm mask (NaN outside)."""
+        return np.where(mask, np.asarray(a, dtype=float), np.nan)
+
+    def _mean_of(a, fmt):
+        ok = np.isfinite(a)
+        n = int(ok.sum())
+        m = float(np.nanmean(a)) if n else float("nan")
+        return m, n
+
+    def _mean_box(ax, text):
+        ax.text(
+            0.03,
+            0.97,
+            text,
+            transform=ax.transAxes,
+            va="top",
+            fontsize=8.5,
+            bbox=dict(boxstyle="round", fc="white", alpha=0.85),
+        )
+
+    def _mean_lines(ax, m, m_mid):
+        """Dashed horizontal lines at the all-band and 500-800 nm means."""
+        ax.axhline(m, ls="--", color="0.35", lw=1.2)
+        ax.axhline(m_mid, ls="--", color="tab:green", lw=1.2)
+
+    def _mean_legend(ax, extra_handles=(), extra_labels=()):
+        """Legend handles/labels incl. the two dashed mean-line proxies."""
+        from matplotlib.lines import Line2D
+
+        handles = list(ax.get_legend_handles_labels()[0]) + list(extra_handles)
+        labels = list(ax.get_legend_handles_labels()[1]) + list(extra_labels)
+        handles += [
+            Line2D([0], [0], ls="--", color="0.35", lw=1.2),
+            Line2D([0], [0], ls="--", color="tab:green", lw=1.2),
+        ]
+        labels += ["mean (all bands)", "mean (500-800 nm)"]
+        return handles, labels
+
     ax = axes[0][0]
     k = _pos([r["flat"]["K12"] if r["flat"] else np.nan for r in results])
     knf = _pos([r["flat"]["K12_nf"] if r["flat"] else np.nan for r in results])
@@ -1027,28 +1075,53 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
     ax.plot(wl, knf, ".", ms=3, alpha=0.6, label="K (N-frame)")
     ax.set_ylabel(r"$K$ (e⁻/DN12)")
     ax.set_title("System gain $K$")
-    ax.legend(fontsize=9)
+    m, n = _mean_of(k, ".1f")
+    m_mid, n_mid = _mean_of(_sub(k, mid), ".1f")
+    _mean_lines(ax, m, m_mid)
+    _mean_box(
+        ax,
+        f"mean K = {m:.1f} e⁻/DN12 (n={n})\n"
+        f"mean K (500-800 nm) = {m_mid:.1f} e⁻/DN12 (n={n_mid})",
+    )
+    ax.legend(*_mean_legend(ax), fontsize=8, loc="best")
     _mark(ax)
     ax.grid(alpha=0.3)
 
     ax = axes[0][1]
-    sr = _pos([r["flat"]["sigma_r_e"] if r["flat"] else np.nan for r in results])
-    srq = _pos([r["flat"]["sigma_r_e_q"] if r["flat"] else np.nan for r in results])
-    ax.plot(wl, sr, "o", ms=3, label=r"$\sigma_r$")
-    ax.plot(wl, srq, ".", ms=3, alpha=0.6, label=r"$\sigma_r$ (Eq. 53 quant-corrected)")
-    ax.set_ylabel(r"$\sigma_r$ (e⁻)")
-    ax.set_title(r"Read noise $\sigma_r$")
-    ax.legend(fontsize=9)
+    snr_max = _pos(
+        [np.sqrt(r["flat"]["Nsat"]) if r["flat"] else np.nan for r in results]
+    )
+    ax.plot(wl, snr_max, "o", ms=3, label="SNR_max")
+    ax.set_ylabel(r"$\mathrm{SNR}_{\max}$")
+    ax.set_title(r"Peak SNR (Eq. 55: $\sqrt{\mu_{e,\mathrm{sat}}}$)")
+    m, n = _mean_of(snr_max, ".1f")
+    m_mid, n_mid = _mean_of(_sub(snr_max, mid), ".1f")
+    _mean_lines(ax, m, m_mid)
+    _mean_box(
+        ax,
+        f"mean SNR_max = {m:.1f} (n={n})\n"
+        f"mean SNR_max (500-800 nm) = {m_mid:.1f} (n={n_mid})",
+    )
+    ax.legend(*_mean_legend(ax), fontsize=8, loc="center")
     _mark(ax)
     ax.grid(alpha=0.3)
 
     ax = axes[1][0]
     dc = np.array([r["dark"]["dark_current_dn_per_s"] for r in results])
     pos = dc > 0
-    ax.semilogy(wl[pos], dc[pos], "o", ms=3)
+    ax.plot(wl[pos], dc[pos], "o", ms=3, label="I_d")
     ax.set_ylabel(r"$I_d$ (DN16/s)")
     ax.set_xlabel("wavelength (nm)")
     ax.set_title("Dark current (Eq. 29 mean fit)")
+    m, n = _mean_of(np.where(pos, dc, np.nan), ".2f")
+    m_mid, n_mid = _mean_of(np.where(pos & mid, dc, np.nan), ".2f")
+    _mean_lines(ax, m, m_mid)
+    _mean_box(
+        ax,
+        f"mean I_d = {m:.2f} DN16/s (n={n})\n"
+        f"mean I_d (500-800 nm) = {m_mid:.2f} DN16/s (n={n_mid})",
+    )
+    ax.legend(*_mean_legend(ax), fontsize=8, loc="best")
     _mark(ax)
     ax.grid(alpha=0.3, which="both")
 
@@ -1057,6 +1130,9 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
         [r["extras"]["prnu1288_pct"] if r["extras"] else np.nan for r in results]
     )
     ax.plot(wl, prnu, "o", ms=3, color="tab:blue", label="PRNU1288 (%)")
+    ax.plot(
+        wl[mid], prnu[mid], "s", ms=3, color="tab:blue", label="PRNU1288 (%) 500-800 nm"
+    )
     ax.set_ylabel("PRNU1288 (%)", color="tab:blue")
     ax.set_xlabel("wavelength (nm)")
     ax.set_title("Nonuniformity (highpass, EMVA §8.1)")
@@ -1065,7 +1141,29 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
         [r["extras"]["dsnu1288_dn"] if r["extras"] else np.nan for r in results]
     )
     ax2.plot(wl, dsnu, ".", ms=3, color="tab:red", label="DSNU1288 (DN16)")
+    ax2.plot(
+        wl[mid],
+        dsnu[mid],
+        "s",
+        ms=3,
+        color="tab:red",
+        label="DSNU1288 (DN16) 500-800 nm",
+    )
     ax2.set_ylabel("DSNU1288 (DN16)", color="tab:red")
+    m_prnu, n = _mean_of(prnu, ".2f")
+    m_dsnu, _ = _mean_of(dsnu, ".2f")
+    m_prnu_mid, n_mid = _mean_of(_sub(prnu, mid), ".2f")
+    m_dsnu_mid, _ = _mean_of(_sub(dsnu, mid), ".2f")
+    _mean_lines(ax, m_prnu, m_prnu_mid)
+    _mean_lines(ax2, m_dsnu, m_dsnu_mid)
+    _mean_box(
+        ax,
+        f"mean PRNU = {m_prnu:.2f} %\nmean DSNU = {m_dsnu:.2f} DN16 (n={n})\n"
+        f"mean PRNU (500-800 nm) = {m_prnu_mid:.2f} %\n"
+        f"mean DSNU (500-800 nm) = {m_dsnu_mid:.2f} DN16 (n={n_mid})",
+    )
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(*_mean_legend(ax, h2, l2), fontsize=8, loc="best")
     _mark(ax)
     ax.grid(alpha=0.3)
 
