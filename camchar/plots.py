@@ -28,8 +28,9 @@ def _title_with_camera(base, camera, roi):
 
 
 def _band_colors(n):
-    """Distinct colors for per-band curves (viridis ramp)."""
-    return plt.cm.viridis(np.linspace(0.0, 0.9, max(n, 1)))
+    """Distinct colors for per-band curves (default C-series palette)."""
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    return [colors[i % len(colors)] for i in range(max(n, 1))]
 
 
 def save_dark_mean_plot(rows, out_dir, roi=None, camera=None):
@@ -79,7 +80,7 @@ def save_dark_mean_plot(rows, out_dir, roi=None, camera=None):
         "\n"
         f"R² = {r2:.6f}"
         "\n"
-        rf"$\mu_{{I,y}} = {slope * 1000:.4f}$ DN16/s",
+        rf"$I_d = {slope * 1000:.4f}$ DN16/s",
         transform=ax.transAxes,
         va="top",
         fontsize=10,
@@ -155,8 +156,6 @@ def save_dark_variance_plot(rows, out_dir, roi=None, camera=None, dsnu=None):
         rf"$\sigma_y^2 = {slope:.4g}\,t {offset:+.2f}$ (DN16²)"
         "\n"
         f"R² = {r2:.6f}"
-        "\n"
-        rf"$\mu_{{I,y}} = {slope * 1000:.4f}$ DN16²/s (Eq. 30 slope)"
         "\n"
         rf"$\sigma_r = \sqrt{{\max(\mathrm{{offset}}, 0)}} = "
         rf"{np.sqrt(max(offset, 0.0)):.2f}$ DN16"
@@ -363,7 +362,7 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
     quantization included): the model curve plus the measured total SNR at
     each exposure step. Saves snr_vs_signal.png.
     """
-    from .analyze import snr_total_measured, snr_total_model  # local: import cycle
+    from .analyze import snr_temporal_model, snr_total_measured, snr_total_model  # local: import cycle
 
     extras = flat.get("extras")
     means = np.array([s["mean"] for _, s in flat["rows"]])
@@ -381,10 +380,10 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
     s_curve = np.linspace(signal.min(), signal.max(), 200)
     ax.loglog(
         s_curve,
-        s_curve / np.sqrt(s_curve + flat["sigma_r_e"] ** 2),
+        snr_temporal_model(s_curve, flat["sigma_r_e_q"], k12),
         "-",
         lw=1.5,
-        label=r"model: $\mu_e/\sqrt{\mu_e + \sigma_r^2}$",
+        label=r"model (Eq. 21): $\mu_e/\sqrt{\sigma_d^2 + \sigma_q^2/K^2 + \mu_e}$",
     )
     ax.loglog(
         s_curve,
@@ -428,10 +427,19 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
         "\n"
         rf"$\sigma_r$ = {flat['sigma_r_e']:.2f} e⁻"
         "\n"
+        rf"$\sigma_d$ (Eq. 53) = {flat['sigma_r_e_q']:.2f} e⁻"
+        "\n"
         rf"$\mu_{{e,\mathrm{{sat}}}}$ = {flat['Nsat']:.0f} e⁻"
+        "\n"
+        rf"$\mathrm{{SNR}}_{{\max}} = \sqrt{{\mu_{{e,\mathrm{{sat}}}}}}"
+        rf" = {np.sqrt(flat['Nsat']):.1f}$"
     )
     if extras:
         text += (
+            "\n"
+            rf"$\mu_{{e,\mathrm{{min}}}}$ (Eq. 27) = {extras['mu_min_e']:.2f} e⁻"
+            "\n"
+            rf"DR (Eq. 28) = {extras['dr']:.0f} ({extras['dr_db']:.1f} dB)"
             "\n"
             rf"DSNU1288 = {extras['dsnu1288_dn'] * k12 / 16.0:.2f} e⁻"
             "\n"
@@ -548,8 +556,9 @@ def save_dark_variance_plot_bands(sel_results, out_dir, roi=None, camera=None):
     (Eq. 18, primary) and N-frame variances, the fitted Eq. 30 lines
     overlaid (solid two-frame, dashed N-frame cross-check), and a text box
     per band reporting the fit equation, R^2, variance-based dark current
-    (fit slope per second) and read noise (sqrt of the fit offset). Saves
-    dark_variance_vs_exposure_bands.png.
+    (fit slope per second) and read noise (sqrt of the fit offset), plus the
+    per-band DSNU1288 (Eq. 66, dark-only) when the band has a flat fit.
+    Saves dark_variance_vs_exposure_bands.png.
     """
     fig, ax = plt.subplots(figsize=(8, 5))
     drew = False
@@ -586,16 +595,22 @@ def save_dark_variance_plot_bands(sel_results, out_dir, roi=None, camera=None):
         ss_tot = float(np.sum((y - y.mean()) ** 2))
         r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
         r2_txt = rf"$R^2 = {r2:.4f}$" if np.isfinite(r2) else r"$R^2 = \text{--}$"
+        extras = r.get("extras")
+        dsnu = extras["dsnu1288_dn"] if extras else None
+        box_text = (
+            rf"$\lambda$ {r['wl_nm']:.0f} nm:  "
+            rf"$\sigma_y^2 = {slope:.4g}\,t {offset:+.2f}$ DN16$^2$"
+            "\n"
+            rf"{r2_txt}  $\cdot$  "
+            rf"$\sigma_r = {np.sqrt(max(offset, 0.0)):.2f}$ DN16"
+        )
+        if dsnu is not None:
+            box_text += f"\nDSNU1288 = {dsnu:.2f} DN16"
         if n_box < 6:  # boxes stack every 0.16 of axes height; keep them on-axes
             ax.text(
                 0.03,
                 0.97 - 0.16 * n_box,
-                rf"$\lambda$ {r['wl_nm']:.0f} nm:  "
-                rf"$\sigma_y^2 = {slope:.4g}\,t {offset:+.2f}$ DN16$^2$"
-                "\n"
-                rf"{r2_txt}  $\cdot$  "
-                rf"$\mu_{{I,y}} = {slope * 1000:.3f}$ DN16$^2$/s  $\cdot$  "
-                rf"$\sigma_r = {np.sqrt(max(offset, 0.0)):.2f}$ DN16",
+                box_text,
                 transform=ax.transAxes,
                 va="top",
                 fontsize=7.5,
@@ -656,7 +671,7 @@ def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=No
         ax.plot(
             x[m],
             y[m],
-            "o-",
+            "o",
             ms=4,
             lw=1.2,
             color=color,
@@ -678,7 +693,7 @@ def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=No
             color=color,
             label=(
                 rf"$\lambda$ {r['wl_nm']:.0f} nm: "
-                rf"$\mu = {a:.3g}\,t {b:+.3g}$" + (f", {r2_txt}" if r2_txt else "")
+                rf"$\mu = {a:.6g}\,t {b:+.2f}$" + (f", {r2_txt}" if r2_txt else "")
             ),
         )
         drew = True
@@ -856,12 +871,19 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
     (model curve + measured points, from the band's EMVA extras). Saves
     snr_vs_signal_bands.png.
     """
-    from .analyze import snr_total_measured, snr_total_model  # local: import cycle
+    from .analyze import (
+        snr_temporal_model,
+        snr_total_measured,
+        snr_total_model,
+    )  # local: import cycle
 
     fig, ax = plt.subplots(figsize=(8, 5))
     drew = False
     drew_total = False
     sig_lo, sig_hi = [], []
+    snr_max_entries = []
+    mu_min_entries = []
+    dr_entries = []
     for color, r in zip(_band_colors(len(sel_results)), sel_results):
         f = r["flat"]
         if not f or not r["dark_rows"]:
@@ -878,7 +900,13 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
             signal, snr, "+", ms=6, color=color, label=rf"$\lambda$ {r['wl_nm']:.0f} nm"
         )
         sc = np.linspace(signal.min(), signal.max(), 100)
-        ax.loglog(sc, sc / np.sqrt(sc + f["sigma_r_e"] ** 2), "-", lw=1.2, color=color)
+        ax.loglog(
+            sc,
+            snr_temporal_model(sc, f["sigma_r_e_q"], f["K12"]),
+            "-",
+            lw=1.2,
+            color=color,
+        )
         if extras:
             ax.loglog(
                 signal,
@@ -899,6 +927,19 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
             drew_total = True
         sig_lo.append(signal.min())
         sig_hi.append(signal.max())
+        snr_max_entries.append(
+            rf"$\mathrm{{SNR}}_{{\max,\,{r['wl_nm']:.0f}\mathrm{{nm}}}}"
+            rf" = {np.sqrt(f['Nsat']):.1f}$"
+        )
+        if extras:
+            mu_min_entries.append(
+                rf"$\mu_{{e,\mathrm{{min}},\,{r['wl_nm']:.0f}\mathrm{{nm}}}}"
+                rf" = {extras['mu_min_e']:.2f}$"
+            )
+            dr_entries.append(
+                rf"$\mathrm{{DR}}_{{{r['wl_nm']:.0f}\mathrm{{nm}}}}"
+                rf" = {extras['dr']:.0f}$"
+            )
         drew = True
     if not drew:
         typer.secho("  ! too few points for per-band SNR plot", fg=typer.colors.YELLOW)
@@ -936,6 +977,22 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
     ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
     ax.grid(which="minor", ls="--", alpha=0.3)
+    per_line = 3
+    lines = []
+    for entries in (snr_max_entries, mu_min_entries, dr_entries):
+        lines += [
+            "  ".join(entries[i : i + per_line])
+            for i in range(0, len(entries), per_line)
+        ]
+    ax.text(
+        0.03,
+        0.97,
+        "\n".join(lines),
+        transform=ax.transAxes,
+        va="top",
+        fontsize=8.5,
+        bbox=dict(boxstyle="round", fc="white", alpha=0.85),
+    )
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     path = out_path / "snr_vs_signal_bands.png"
@@ -989,7 +1046,7 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
     dc = np.array([r["dark"]["dark_current_dn_per_s"] for r in results])
     pos = dc > 0
     ax.semilogy(wl[pos], dc[pos], "o", ms=3)
-    ax.set_ylabel(r"$\mu_{I,y}$ (DN16/s)")
+    ax.set_ylabel(r"$I_d$ (DN16/s)")
     ax.set_xlabel("wavelength (nm)")
     ax.set_title("Dark current (Eq. 29 mean fit)")
     _mark(ax)
@@ -1018,6 +1075,132 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     path = out_path / "band_parameters_vs_wavelength.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    return None
+
+
+def save_flat_uniformity_plot(
+    imgs, wl_sel, exp_ms, n_cubes, out_dir, roi=None, camera=None
+):
+    """3x3 grid of the shortest flat exposure's bands with the ROI overlaid.
+
+    imgs is the (R, C, 9) float32 frame-average per band (DN16) from
+    band_analyze._load_shortest_flat_frames. Each subplot stretches its own
+    1-99 percentile range (per-band contrast, so dark-edge and bright bands
+    are both readable); the dashed red rectangle is the analysis ROI, drawn
+    on pixel edges so it aligns with imshow. Saves
+    flat_uniformity_{exp_ms:g}ms.png.
+    """
+    from matplotlib.patches import Rectangle  # local: matches Line2D pattern
+
+    n_sel = imgs.shape[2]
+    fig, axes = plt.subplots(3, 3, figsize=(12, 12), squeeze=False)
+    r0, r1, c0, c1 = roi
+    for i in range(9):
+        ax = axes[i // 3][i % 3]
+        if i >= n_sel:
+            ax.axis("off")
+            continue
+        b = imgs[:, :, i]
+        vmin, vmax = np.percentile(b, (1, 99))
+        ax.imshow(b, cmap="viridis", vmin=vmin, vmax=vmax, origin="upper")
+        ax.add_patch(
+            Rectangle(
+                (c0 - 0.5, r0 - 0.5),
+                c1 - c0,
+                r1 - r0,
+                fill=False,
+                ec="tab:red",
+                ls="--",
+                lw=1.2,
+            )
+        )
+        ax.set_title(
+            rf"$\lambda$ = {wl_sel[i]:.0f} nm · mean {b.mean():.0f} DN16",
+            fontsize=10,
+        )
+        ax.set_xticks([])
+        ax.set_yticks([])
+    fig.suptitle(
+        _title_with_camera(
+            f"Flat-field uniformity ({exp_ms * 1000:g} ms, avg of {n_cubes} cubes)",
+            camera,
+            roi,
+        ),
+        fontsize=11,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    path = out_path / f"flat_uniformity_{exp_ms * 1000:g}ms.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    return None
+
+
+def save_band_mean_roi_plot(stats, wl, out_dir, kind, clip_dn, roi=None, camera=None):
+    """Bar chart of the per-band ROI mean, one subplot per exposure (SPECIM).
+
+    stats is the 'stats' dict from band_analyze._load_kind_stats:
+    {exp_s: [roi_stats per band]}, each band's 'mean' being the mean pixel
+    value over all frames x the ROI in DN16. Every subplot shows one
+    exposure's 204 bars (x = wavelength in nm, y = mean in DN16); bands whose
+    mean reached the clip level are drawn red, with the 2^16 max-DN16 line
+    as reference. Saves band_mean_roi_{kind}.png.
+    """
+    exps = sorted(stats)
+    if not exps:
+        typer.secho(
+            f"  ! no {kind} exposures for per-band ROI mean plot",
+            fg=typer.colors.YELLOW,
+        )
+        return None
+    n_cols = min(len(exps), 4)
+    n_rows = int(np.ceil(len(exps) / n_cols))
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(6.4 * n_cols, 3.6 * n_rows), squeeze=False
+    )
+    wl = np.asarray(wl)
+    bar_w = max(0.8 * (wl[-1] - wl[0]) / max(len(wl) - 1, 1), 1.0)
+    for i, e in enumerate(exps):
+        ax = axes[i // n_cols][i % n_cols]
+        y = np.array([s["mean"] for s in stats[e]])
+        if len(y) != len(wl):
+            print(
+                f"  ! [{kind}] {e * 1000:g} ms: {len(y)} bands != {len(wl)} "
+                "wavelengths, skipping subplot"
+            )
+            continue
+        sat = y >= clip_dn
+        ax.bar(wl, y, width=bar_w, color=np.where(sat, "tab:red", "tab:blue"))
+        ax.set_title(f"{e * 1000:g} ms", fontsize=10)
+        ax.set_xlim(wl[0], wl[-1])
+        ax.grid(alpha=0.3, axis="y")
+        if sat.any():
+            ax.axhline(2**16, ls="--", color="0.4", lw=1)
+            ax.plot(
+                [],
+                [],
+                "s",
+                color="tab:red",
+                label=f"mean \u2265 {clip_dn} DN16",
+            )
+            ax.legend(fontsize=8, loc="upper left")
+    for i in range(len(exps), n_rows * n_cols):
+        axes[i // n_cols][i % n_cols].axis("off")
+    fig.suptitle(
+        _title_with_camera(f"ROI mean per band ({kind})", camera, roi),
+        fontsize=11,
+    )
+    fig.supxlabel("wavelength (nm)")
+    fig.supylabel(r"$\mu_y$ (DN16)")
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    path = out_path / f"band_mean_roi_{kind}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)

@@ -47,8 +47,10 @@ PTC_FIT_SAT_FRAC = (
 )
 QUANT_STEP_DN16 = 16.0  # DN16 per 12-bit LSB (DN12 << 4 storage)
 
-DEFAULT_ROI = (500, 900, 750, 1150)  # playerone Apollo-M central 400x400
-DEFAULT_ROI_SPECIM = (156, 356, 156, 356)  # SPECIM IQ 512x512 central 200x200
+# playerone Apollo-M central 400x400
+DEFAULT_ROI = (500, 900, 750, 1150)
+# SPECIM IQ ROI region, see uniformity plot and adjust if needed
+DEFAULT_ROI_SPECIM = (140, 290, 156, 306)
 
 _VENDOR_NAMES = {"playerone": "Player One", "basler": "Basler"}
 
@@ -585,8 +587,16 @@ def emva_extras_core(
     bias = dk["bias_dn"]
     nsat = (mu_sat - bias) * k12 / 16.0
 
-    sig = flat.get("sigma_r_e_q", flat["sigma_r_e"])
-    mu_min = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * sig**2))  # SNR = 1 point
+    sig = flat.get("sigma_r_e_q")
+    if sig is not None:
+        # Eq. 27: sqrt(sigma_d^2 + sigma_q^2/K^2 + 1/4) + 1/2 -- the
+        # quantization variance is added back on the Eq. 53-corrected read
+        # noise (numerically equal to using the measured dark sigma)
+        q2_e = (QUANT_STEP_DN16**2 / 12.0) * (flat["K12"] / 16.0) ** 2
+        sig2 = sig**2 + q2_e
+    else:
+        sig2 = flat["sigma_r_e"] ** 2  # measured sigma already contains sigma_q^2
+    mu_min = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * sig2))  # Eq. 27 (SNR = 1 point)
     dr = nsat / mu_min  # Eq. 28
 
     s2_dark = dsnu1288_core(d_img, dark_tvar_short, dark_L) ** 2
@@ -678,6 +688,18 @@ def emva1288_extras(dark_seq, flat_seq, dk, flat):
     )
     typer.echo(f"  DSNU1288    = {x['dsnu1288_dn']:.2f} DN16 (highpass dark image)")
     return x
+
+
+def snr_temporal_model(signal_e, sigma_d_e, k12):
+    """EMVA R4 Linear Eq. 21: temporal-SNR model curve (pure).
+
+    sigma_d_e is the Eq. 53 quantization-corrected read noise; the
+    quantization variance sigma_q^2/K^2 is added explicitly so the model
+    matches the standard's equation form (numerically equal to using the
+    measured dark sigma, which already contains quantization).
+    """
+    q2_e = (QUANT_STEP_DN16**2 / 12.0) * (k12 / 16.0) ** 2
+    return signal_e / np.sqrt(sigma_d_e**2 + q2_e + signal_e)
 
 
 def snr_total_model(extras, signal_e, sigma_d_e, k12):

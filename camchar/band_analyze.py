@@ -28,9 +28,11 @@ from .analyze import (
     fit_flat_stats,
 )
 from .plots import (
+    save_band_mean_roi_plot,
     save_band_parameters_plot,
     save_dark_plot_bands,
     save_dark_variance_plot_bands,
+    save_flat_uniformity_plot,
     save_linearity_plot_bands,
     save_ptc_plot_bands,
     save_snr_plot_bands,
@@ -108,6 +110,28 @@ def _load_kind_stats(exps, kind, r0, r1, c0, c1):
         counts[exp_s] = n
         del stack
     return {"stats": stats, "means": means, "counts": counts, "wl": wavelengths}
+
+
+def _load_shortest_flat_frames(flat_exps, sel_bands):
+    """Full-frame per-band means of the shortest flat exposure.
+
+    Returns (imgs, wl_sel, exp_s, n_cubes): imgs is a (R, C, n_sel) float32
+    frame-average over all cubes of the shortest flat exposure (DN16),
+    wl_sel the wavelengths of the selected bands. One extra pass over a
+    single exposure; feeds the illumination-uniformity 3x3 grid.
+    """
+    exp_s, exp_dir = flat_exps[0]
+    hdrs = specim.iter_cubes(exp_dir)
+    if not hdrs:
+        return None, None, exp_s, 0
+    img = specim.open_cube(hdrs[0])
+    nl, ns = img.shape[0], img.shape[1]
+    img.fid.close()
+    stack, wl = specim.load_exposure_stack(exp_dir, exp_s, 0, nl, 0, ns)
+    if stack is None:
+        return None, None, exp_s, 0
+    means = stack.mean(axis=0, dtype=np.float32)
+    return means[:, :, sel_bands], wl[sel_bands], exp_s, stack.shape[0]
 
 
 def _extras_for_band(b, dark, flat, dk, flat_fit):
@@ -421,6 +445,16 @@ def run(cam_dir, roi, n_plot_bands=5):
 
     out_dir = Path("outputs") / cam_dir.name
     _write_csv(results, out_dir / "band_parameters.csv")
+    save_band_mean_roi_plot(dark["stats"], wl, out_dir, "dark", CLIP_DN, roi, _CAMERA_LABEL)
+    if flat["stats"]:
+        save_band_mean_roi_plot(flat["stats"], wl, out_dir, "flat", CLIP_DN, roi, _CAMERA_LABEL)
+    if flat_exps:
+        sel9 = _select_bands(n_bands, 9)
+        f_imgs, wl_sel, exp_s, n_cubes = _load_shortest_flat_frames(flat_exps, sel9)
+        if f_imgs is not None:
+            save_flat_uniformity_plot(
+                f_imgs, wl_sel, exp_s, n_cubes, out_dir, roi, _CAMERA_LABEL
+            )
     sel_results = [r for r in results if r["band"] in selected]
     save_dark_plot_bands(sel_results, out_dir, roi, _CAMERA_LABEL)
     save_dark_variance_plot_bands(sel_results, out_dir, roi, _CAMERA_LABEL)
