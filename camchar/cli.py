@@ -7,8 +7,9 @@ Usage examples:
   python -m camchar warmup-sensor --vendor basler
   python -m camchar source-stability-check --vendor basler
 
---vendor (playerone | basler) is required on every acquisition command;
-analyze is offline and needs no vendor. Camera must be on and connected.
+--vendor (playerone | basler | thorlabs) is required on every acquisition
+command; analyze is offline and needs no vendor. Camera must be on and
+connected.
 Lens cap ON for dark frames; uniform illumination (diffuser) for flat
 frames. Frames are saved under <out>/<vendor>_<model>_(<sensor>)/dark|flat
 (--out defaults to 'data').
@@ -71,7 +72,9 @@ def _ms_list(exposures_ms):
 
 
 def _vendor_option():
-    return typer.Option(..., help="camera vendor backend (playerone | basler)")
+    return typer.Option(
+        ..., help="camera vendor backend (playerone | basler | thorlabs)"
+    )
 
 
 def _run_sequence(vendor, out, exposures_ms, frames, gain, notes, seq_type):
@@ -130,6 +133,14 @@ def _run_sequence(vendor, out, exposures_ms, frames, gain, notes, seq_type):
 
 def _warmup_sensor(vendor):
     backend = get_backend(vendor)
+    if not getattr(backend, "has_temperature", True):
+        typer.secho(
+            f"[warmup] vendor '{vendor}' exposes no sensor temperature "
+            "(no SDK API): thermal stability cannot be verified -- run the "
+            "camera for a fixed time manually instead, then take darks",
+            fg=typer.colors.RED,
+        )
+        return 1
     typer.secho(
         f"[warmup] vendor={vendor}  opening camera...", bold=True, fg=typer.colors.CYAN
     )
@@ -344,7 +355,7 @@ def get_dark_frames(
     ),
     frames: int = typer.Option(DEFAULT_FRAMES, help="frames per exposure"),
     gain: float = typer.Option(
-        0.0, help="fixed gain (dB for basler, unitless for playerone)"
+        0.0, help="fixed gain (dB for basler, integer index for playerone/thorlabs)"
     ),
     notes: str = typer.Option("dark", help="metadata notes, e.g. 'lens cap on'"),
 ):
@@ -370,7 +381,7 @@ def get_flat_frames(
     ),
     frames: int = typer.Option(DEFAULT_FRAMES, help="frames per exposure"),
     gain: float = typer.Option(
-        0.0, help="fixed gain (dB for basler, unitless for playerone)"
+        0.0, help="fixed gain (dB for basler, integer index for playerone/thorlabs)"
     ),
     notes: str = typer.Option("flat", help="metadata notes, e.g. 'green LED ~530nm'"),
 ):
@@ -428,7 +439,7 @@ def source_stability_check(
         SOURCE_STABILITY_FRAMES, help="consecutive frames per exposure"
     ),
     gain: float = typer.Option(
-        0.0, help="fixed gain (dB for basler, unitless for playerone)"
+        0.0, help="fixed gain (dB for basler, integer index for playerone/thorlabs)"
     ),
 ):
     """Check the light-source stability for flat-field measurements."""

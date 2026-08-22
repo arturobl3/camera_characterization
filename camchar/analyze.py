@@ -52,7 +52,11 @@ DEFAULT_ROI = (500, 900, 750, 1150)
 # SPECIM IQ ROI region, see uniformity plot and adjust if needed
 DEFAULT_ROI_SPECIM = (140, 290, 156, 306)
 
-_VENDOR_NAMES = {"playerone": "Player One", "basler": "Basler"}
+_VENDOR_NAMES = {
+    "playerone": "Player One",
+    "basler": "Basler",
+    "thorlabs": "Thorlabs",
+}
 
 
 def load_camera_meta(data_dir):

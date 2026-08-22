@@ -15,8 +15,13 @@ uv.lock
 # macOS
 .DS_Store
 
+# Thorlabs SDK distribution (runtime subset vendored under vendor/thorlabs)
+/Scientific Camera Interfaces/
+
 #opencode
 .opencode
 
 #vscode
 settings.json
+
+/tmp

@@ -72,6 +72,10 @@ class FailBackend(FakeBackend):
         raise RuntimeError("simulated USB hiccup")
 
 
+class NoTempBackend(FakeBackend):
+    has_temperature = False
+
+
 def invoke(monkeypatch, args, backend):
     monkeypatch.setattr(cli, "get_backend", lambda name: backend())
     return runner.invoke(cli.app, args)
@@ -112,6 +116,12 @@ def test_warmup_aborted(monkeypatch):
     monkeypatch.setattr(cli, "WARMUP_MAX_CONSECUTIVE_FAILS", 2)
     r = invoke(monkeypatch, ["warmup-sensor", "--vendor", "fake"], FailBackend)
     assert r.exit_code == 1
+
+
+def test_warmup_no_temperature_backend(monkeypatch):
+    r = invoke(monkeypatch, ["warmup-sensor", "--vendor", "fake"], NoTempBackend)
+    assert r.exit_code == 1
+    assert "no sensor temperature" in r.output
 
 
 def test_bad_exposures(monkeypatch):

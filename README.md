@@ -6,6 +6,12 @@ implements the **Player One Astronomy** backend (tested with Apollo-M / IMX174 o
 macOS, SDK 3.10.1) and the **Basler** backend via pypylon (tested with
 acA1920-155um / IMX174 over USB3 on Windows, pypylon 26.7).
 
+> **New here?** Start with the step-by-step guide at
+> [`docs/emva-noise-characterization-guide.md`](docs/emva-noise-characterization-guide.md)
+> — the full EMVA 1288 pipeline (dark/flat acquisition, gain K, read noise,
+> saturation, DSNU/PRNU, SNR/DR), with the pitfalls we hit and the camchar
+> commands for each step.
+
 ## Quick start (macOS)
 
 ```bash
@@ -147,11 +153,15 @@ camera_characterization/
 │       ├── base.py            # CameraBackend ABC
 │       ├── playerone.py       # Player One backend (pitfalls encoded)
 │       ├── basler.py          # Basler backend (pypylon, software trigger)
+│       ├── thorlabs.py        # Thorlabs backend (TLCamera SDK, per-frame trigger)
 │       └── __init__.py        # backend registry
 ├── vendor/
-│   └── playerone/
-│       ├── lib/               # SDK binary for YOUR OS (see below)
-│       └── py/                # vendored pyPOACamera.py (platform-aware loading)
+│   ├── playerone/
+│   │   ├── lib/               # SDK binary for YOUR OS (see below)
+│   │   └── py/                # vendored pyPOACamera.py (platform-aware loading)
+│   └── thorlabs/
+│       ├── lib/               # TLCamera SDK native DLLs (Windows x64 subset)
+│       └── py/thorlabs_tsi_sdk/  # vendored official Python wrapper (0.0.8)
 ├── pyproject.toml             # uv-managed: uv sync, uv run camchar ...
 ├── data/                      # acquired sequences (gitignored)
 │   ├── playerone_Apollo-M_(IMX174)/
@@ -197,6 +207,30 @@ Default on `configure()` so pylon Viewer leftovers cannot leak in. Exposures
 outside the camera range (minimum 21 µs on the acA1920-155um) are clamped
 with a warning, and the effective exposure is what lands in metadata and
 filenames.
+
+## Thorlabs (TLCamera SDK) setup
+
+The runtime subset of Thorlabs' *Scientific Camera Interfaces* SDK is vendored:
+native DLLs in `vendor/thorlabs/lib/` (camera sdk + zelux USB device + hotplug
+monitor + logger, ~700 KB; the 180 MB color/polarization processors a mono
+camera never loads are omitted) and the official Python wrapper in
+`vendor/thorlabs/py/thorlabs_tsi_sdk/`. Windows x64 binaries only right now.
+Install ThorCam once for the USB driver (WinUSB); after that no Thorlabs
+software needs to run. Verified on the Kiralux LP126MU:
+
+- frames arrive **right-aligned DN12** in uint16 and are shifted `<<4` to DN16
+  at acquisition (same convention as basler/playerone);
+- `--gain` is an integer gain index (0..480 on the LP126MU; the dB equivalent
+  is recorded as `gain_db` in metadata);
+- exposures outside 28 µs .. 14.7 s are clamped with a warning;
+- **no sensor-temperature API exists in this SDK** — `warmup-sensor` refuses
+  to run against thorlabs cameras (thermal stability cannot be verified);
+  warm the camera up for a fixed time manually instead;
+- hot-pixel correction is disabled by `configure()` (it substitutes neighbor
+  values and would corrupt variance statistics).
+
+Full SDK distribution (docs, installers, examples) lives untracked under
+`Scientific Camera Interfaces/`.
 
 ## Known pitfalls (empirical, macOS SDK 3.10.1)
 

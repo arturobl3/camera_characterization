@@ -44,3 +44,14 @@ except (ImportError, OSError) as _e:
     warnings.warn(
         f"basler backend unavailable (pypylon not installed): {_e}", stacklevel=2
     )
+
+try:
+    from . import thorlabs  # noqa: E402, F401  (registers the thorlabs backend on import)
+except (ImportError, OSError) as _e:
+    # The vendored wrapper imports cleanly without the native DLLs (they load
+    # lazily at TLCameraSDK() construction), so this only fires for missing
+    # vendor/thorlabs files or unrelated import errors. Offline commands and
+    # a missing camera surface at open() instead.
+    import warnings
+
+    warnings.warn(f"thorlabs backend unavailable ({_e})", stacklevel=2)
