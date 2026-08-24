@@ -56,6 +56,7 @@ camchar get-flat-frames --vendor playerone [--out ROOT] [--exposures MS,MS,...] 
 camchar analyze --data DIR [--roi r0:r1:c0:c1] [--bands N]
 camchar warmup-sensor --vendor basler
 camchar source-stability-check --vendor basler [--exposures MS,MS,...] [--frames N] [--gain G]
+camchar check-saturation --vendor basler [--exposures MS,MS,...] [--gain G]
 ```
 
 Exposure times are given in milliseconds (fractional values allowed). Defaults: dark
@@ -73,6 +74,14 @@ the first frame (the reference); any deviation above 0.1% triggers a per-exposur
 warning and exit code 1. Run it on the flat-field source before acquisition —
 different exposures probe different fluctuation timescales (short exposures see
 fast ripple, long exposures catch slow drift).
+`check-saturation` records 1 frame per default-sweep exposure and stops at the first
+one whose clipped-pixel fraction trips the EMVA criterion (≥ 0.2 % of pixels at
+65504 DN16 — the same bar `analyze` applies to PTC points). Ideal flat setup is
+saturation beginning exactly at the 3rd-to-last sweep exposure (~687 ms on the
+default grid): that verdict exits 0; anything else exits 1 and prints the exact
+intensity multiplier to apply (extrapolated from a through-origin mean-vs-exposure
+fit when nothing saturates during the sweep). Run it while tuning the light source,
+before flat acquisition.
 `analyze` accepts the data root (`data`) or a camera dir directly
 (`data/playerone_Apollo-M_(IMX174)`); a single camera dir under the root is
 auto-discovered. It reads `<camera>/dark/` + `<camera>/flat/` from metadata.json,
@@ -178,6 +187,10 @@ camera_characterization/
 Add a vendor: implement `CameraBackend` in `camchar/backends/<vendor>.py`, decorate
 with `@register("<vendor>")`, done.
 
+Data formats — `.npy` stacks, `metadata.json` fields, raw-Bayer handling for
+color cameras, and the DN16 (12-bit << 4) storage convention — are documented
+in [docs/file_formats.md](docs/file_formats.md).
+
 ## Player One SDK setup per OS
 
 Put the SDK binary for your OS in `vendor/playerone/lib/`:
@@ -199,14 +212,23 @@ Put the SDK binary for your OS in `vendor/playerone/lib/`:
 
 `uv add pypylon` — the wheel bundles the pylon runtime (Windows/macOS/Linux).
 If the camera does not enumerate, install the pylon Software Suite to provide
-the USB3 driver. The backend grabs `Mono12` (unpacked) and shifts `<<4` to
-DN16, so the stored data and every downstream constant match the Player One
-path. Per-frame software triggering is used (no stale free-run buffers when
+the USB3 driver. The backend grabs `Mono12` (mono models) or **raw unpacked
+BayerRG12** (color models) and shifts `<<4` to DN16, so the stored data and
+every downstream constant match the Player One path.
+
+Color models (tested: a2A3536-31ucBAS / IMX676): their `Mono*` pixel formats
+are interpolated (demosaiced/green-upsampled) and never used; raw Bayer data
+keeps temporal metrics exact per photosite, and `analyze` automatically pools
+the four CFA sub-lattices for the spatial DSNU/PRNU so the Bayer pattern
+cannot inflate them (per-channel values are printed).
+
+Per-frame software triggering is used (no stale free-run buffers when
 the exposure changes between snaps); the camera's stored user set is reset to
-Default on `configure()` so pylon Viewer leftovers cannot leak in. Exposures
-outside the camera range (minimum 21 µs on the acA1920-155um) are clamped
-with a warning, and the effective exposure is what lands in metadata and
-filenames.
+Default on `configure()` so pylon Viewer leftovers cannot leak in, and the
+loaded geometry is kept (full-sensor size can include optical-black rows).
+Exposures outside the camera range (21 µs on the acA1920-155um, 12 µs on the
+a2A3536) are clamped with a warning, and the effective exposure is what lands
+in metadata and filenames.
 
 ## Thorlabs (TLCamera SDK) setup
 

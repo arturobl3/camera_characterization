@@ -72,6 +72,29 @@ def load_camera_meta(data_dir):
     return None
 
 
+def _dataset_cfa_format(cam_dir):
+    """Pixel format of the latest raw-Bayer acquisition, or '' if none.
+
+    metadata.json is append-only and may mix sessions; scanning every entry
+    (and keeping the last Bayer one) keeps the CFA decision and the phase
+    labels consistent even when early entries predate pixel_format recording.
+    """
+    fmt = ""
+    for seq_type in ("dark", "flat"):
+        meta_path = Path(cam_dir) / seq_type / "metadata.json"
+        if not meta_path.exists():
+            continue
+        try:
+            entries = json.loads(meta_path.read_text())
+        except (OSError, ValueError):
+            continue
+        for m in entries:
+            candidate = str(m.get("pixel_format", ""))
+            if candidate.startswith("Bayer"):
+                fmt = candidate
+    return fmt
+
+
 def load_camera_info(data_dir):
     """Camera display label like 'Player One Apollo-M (IMX174)' from metadata."""
     m = load_camera_meta(data_dir)
@@ -187,6 +210,34 @@ def _binomial3(img):
 def highpass(img):
     """EMVA 1288 R4 Section 8.1 highpass: img - binomial3(box11(box7(img)))."""
     return img - _binomial3(_box_filter(_box_filter(img, 7), 11))
+
+
+_CFA_LABELS = ("R", "G1", "G2", "B")
+
+# Pixel-format letters -> phase labels in _cfa_phases order (0,0),(0,1),(1,0),(1,1)
+_CFA_LAYOUTS = {
+    "RG": ("R", "G1", "G2", "B"),
+    "GR": ("G1", "R", "B", "G2"),
+    "GB": ("G1", "B", "R", "G2"),
+    "BG": ("B", "G1", "G2", "R"),
+}
+
+
+def _cfa_labels(pixel_format=""):
+    """Phase channel labels for a recorded Bayer pixel format (pure)."""
+    fmt = str(pixel_format)
+    if fmt.startswith("Bayer") and len(fmt) >= 7:
+        return _CFA_LAYOUTS.get(fmt[5:7].upper(), _CFA_LABELS)
+    return _CFA_LABELS
+
+
+def _cfa_phases(img):
+    """The four Bayer sub-lattices of an ROI image (pure).
+
+    Order is (0,0), (0,1), (1,0), (1,1); label them with _cfa_labels() for
+    the pixel format at hand.
+    """
+    return [img[i::2, j::2] for i in range(2) for j in range(2)]
 
 
 def two_frame_stats(stack, roi):
@@ -558,18 +609,30 @@ def analyze_flats(seq, dark):
     return flat
 
 
-def dsnu1288_core(d_img, tvar, n):
+def dsnu1288_core(d_img, tvar, n, cfa=False):
     """Eq. 66 DSNU1288 (DN16): sqrt of highpass dark variance minus the Eq. 36 temporal residual (pure).
 
     d_img is the frame-averaged dark ROI image (Eq. 33), tvar its temporal
     variance, n the frame count; the highpass is the Section 8.1 filter.
+    With cfa=True the four Bayer sub-lattices are processed separately (the
+    CFA period survives the highpass and would inflate the estimate) and the
+    phase variances are averaged before the sqrt.
     """
-    s2 = max(float(highpass(d_img).var()) - tvar / n, 0.0)
+    parts = _cfa_phases(d_img) if cfa else [d_img]
+    s2 = np.mean([max(float(highpass(p).var()) - tvar / n, 0.0) for p in parts])
     return float(np.sqrt(s2))
 
 
 def emva_extras_core(
-    dk, flat, d_img, f_img, dark_tvar_short, dark_L, flat_tvar_50, flat_L
+    dk,
+    flat,
+    d_img,
+    f_img,
+    dark_tvar_short,
+    dark_L,
+    flat_tvar_50,
+    flat_L,
+    cfa=False,
 ):
     """Saturation/DR/PRNU1288/DSNU1288 numbers (pure, no printing).
 
@@ -578,6 +641,8 @@ def emva_extras_core(
     flat_tvar_50 their temporal variances; dark_L/flat_L the frame counts
     for the Eq. 36 temporal-residual removal. Returns None when no point
     passes the saturation test.
+    With cfa=True the Bayer sub-lattices are pooled in the variance domain
+    (see dsnu1288_core) and per-phase values are returned alongside.
     """
     rows = flat["rows"]
     ok = [rs for rs in rows if rs[1]["sat_frac"] <= SAT_CLIP_FRAC]
@@ -603,17 +668,26 @@ def emva_extras_core(
     mu_min = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * sig2))  # Eq. 27 (SNR = 1 point)
     dr = nsat / mu_min  # Eq. 28
 
-    s2_dark = dsnu1288_core(d_img, dark_tvar_short, dark_L) ** 2
-    s2_50 = max(
-        float(highpass(f_img - d_img).var())
-        - flat_tvar_50 / flat_L
-        - dark_tvar_short / dark_L,
-        0.0,
-    )
+    d_parts = _cfa_phases(d_img) if cfa else [d_img]
+    f_parts = _cfa_phases(f_img) if cfa else [f_img]
+    s2_dark_parts = [
+        max(float(highpass(p).var()) - dark_tvar_short / dark_L, 0.0) for p in d_parts
+    ]
+    s2_50_parts = [
+        max(
+            float(highpass(f_p - d_p).var())
+            - flat_tvar_50 / flat_L
+            - dark_tvar_short / dark_L,
+            0.0,
+        )
+        for f_p, d_p in zip(f_parts, d_parts)
+    ]
+    s2_dark = float(np.mean(s2_dark_parts))
+    s2_50 = float(np.mean(s2_50_parts))
     prnu1288 = (
         100.0 * np.sqrt(max(s2_50 - s2_dark, 0.0)) / (f_img.mean() - d_img.mean())
     )
-    return {
+    out = {
         "mu_sat_dn": mu_sat,
         "nsat_e": nsat,
         "mu_min_e": mu_min,
@@ -623,9 +697,18 @@ def emva_extras_core(
         "dsnu1288_dn": float(np.sqrt(s2_dark)),
         "sat_fallback": fallback,
     }
+    if cfa:
+        # per-channel view (each phase normalized by its own signal; the
+        # combined headline number uses the whole-ROI signal)
+        out["prnu_phase_pct"] = [
+            100.0 * np.sqrt(max(s50 - sd, 0.0)) / (f_p.mean() - d_p.mean())
+            for f_p, d_p, s50, sd in zip(f_parts, d_parts, s2_50_parts, s2_dark_parts)
+        ]
+        out["dsnu_phase_dn"] = [float(np.sqrt(v)) for v in s2_dark_parts]
+    return out
 
 
-def emva1288_extras(dark_seq, flat_seq, dk, flat):
+def emva1288_extras(dark_seq, flat_seq, dk, flat, cfa=False, cfa_labels=None):
     """EMVA R4 Linear extras: saturation (6.6), DR (Eq. 28), PRNU1288/DSNU1288.
 
     PRNU/DSNU use the Section 8.1 highpass (7x7 + 11x11 box then 3x3 binomial,
@@ -634,6 +717,8 @@ def emva1288_extras(dark_seq, flat_seq, dk, flat):
     50%-saturation PRNU image (Eq. 67). DSNU1288 is reported in DN16 (Eq. 66
     would give e- via K); the threshold/DR are in electrons via the PTC gain
     (Eq. 66 needs no calibrated photodiode, only photon units do).
+    cfa=True pools the Bayer sub-lattices per emva_extras_core and prints the
+    per-channel values; cfa_labels overrides the channel names.
     """
     typer.secho(
         "\n=== EMVA 1288 R4 Linear (saturation, nonuniformity, DR) ===",
@@ -671,6 +756,7 @@ def emva1288_extras(dark_seq, flat_seq, dk, flat):
         dark_L=d_stack.shape[0],
         flat_tvar_50=rows[idx][1]["tf_tvar"],
         flat_L=f_stack.shape[0],
+        cfa=cfa,
     )
     if x is None:
         return
@@ -691,6 +777,17 @@ def emva1288_extras(dark_seq, flat_seq, dk, flat):
         f"(highpass, {f_exp * 1000:.1f} ms ~ 50% sat)"
     )
     typer.echo(f"  DSNU1288    = {x['dsnu1288_dn']:.2f} DN16 (highpass dark image)")
+    if cfa:
+        labels = cfa_labels or _CFA_LABELS
+        typer.echo(
+            "  CFA phases ("
+            + ",".join(labels)
+            + "): PRNU "
+            + "/".join(f"{v:.2f}" for v in x["prnu_phase_pct"])
+            + " %, DSNU "
+            + "/".join(f"{v:.2f}" for v in x["dsnu_phase_dn"])
+            + " DN16"
+        )
     return x
 
 
@@ -761,9 +858,15 @@ def run(data_dir, roi=None, bands=5):
     )
     dark_seq = load_sequence(cam_dir, "dark")
     dk = analyze_dark(dark_seq)
+    meta = load_camera_meta(cam_dir)
+    camera = load_camera_info(cam_dir)
+    # Raw-Bayer datasets: spatial metrics pool the four CFA sub-lattices.
+    # The format comes from a scan of all metadata entries so it stays
+    # consistent even when early entries predate pixel_format recording.
+    bayer_format = _dataset_cfa_format(cam_dir)
+    cfa = bool(bayer_format)
+    cfa_labels = _cfa_labels(bayer_format)
     if dk:
-        camera = load_camera_info(cam_dir)
-        meta = load_camera_meta(cam_dir)
         out_dir = Path("outputs") / (camera_dir_name(meta) if meta else cam_dir.name)
         typer.echo(f"\n  bias floor (shortest exp): {dk['bias_dn']:.2f} DN16")
         typer.echo(
@@ -781,12 +884,16 @@ def run(data_dir, roi=None, bands=5):
         save_dark_mean_plot(dk["rows"], out_dir, roi, camera)
         d_stack = min(dark_seq, key=lambda es: es[0])[1]
         d_img = d_stack[:, ROI[0], ROI[1]].astype(np.float64).mean(axis=0)
-        dsnu = dsnu1288_core(d_img, dk["rows"][0][1]["tf_tvar"], d_stack.shape[0])
+        dsnu = dsnu1288_core(
+            d_img, dk["rows"][0][1]["tf_tvar"], d_stack.shape[0], cfa=cfa
+        )
         save_dark_variance_plot(dk["rows"], out_dir, roi, camera, dsnu=dsnu)
         flat_seq = load_sequence(cam_dir, "flat")
         flat = analyze_flats(flat_seq, dk)
         if flat:
-            flat["extras"] = emva1288_extras(dark_seq, flat_seq, dk, flat)
+            flat["extras"] = emva1288_extras(
+                dark_seq, flat_seq, dk, flat, cfa=cfa, cfa_labels=cfa_labels
+            )
             save_linearity_plot(
                 flat["rows"], flat["bias_dn"], out_dir, CLIP_DN, roi, camera
             )

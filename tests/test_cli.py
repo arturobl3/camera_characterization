@@ -76,6 +76,42 @@ class NoTempBackend(FakeBackend):
     has_temperature = False
 
 
+class SatSweepBackend(FakeBackend):
+    """check-saturation backend: 1 frame per exposure from a ms->mean map.
+
+    mean values >= 65504 count as saturated frames (every pixel clipped).
+    """
+
+    means_ms = {}
+
+    def snap(self, exp, n):
+        ms = round(exp * 1000.0, 6)
+        v = self.means_ms[ms]
+        return np.full((1, 8, 8), v, dtype=np.uint16)
+
+
+class SatIdealBackend(SatSweepBackend):
+    # first saturation exactly at exposures[-3] (the 40 ms point)
+    means_ms = {5.0: 1000, 10.0: 2000, 40.0: 65504}
+
+
+class SatTooBrightBackend(SatSweepBackend):
+    # saturates immediately -> reduce intensity
+    means_ms = {10.0: 65504}
+
+
+class SatDimBackend(FakeBackend):
+    # linear low signal, nothing saturates -> extrapolated increase factor
+    def snap(self, exp, n):
+        v = int(round(exp * 100000.0))  # 100 DN16 per ms
+        return np.full((1, 8, 8), v, dtype=np.uint16)
+
+
+class SatZeroSignalBackend(FakeBackend):
+    def snap(self, exp, n):
+        return np.zeros((1, 8, 8), dtype=np.uint16)
+
+
 def invoke(monkeypatch, args, backend):
     monkeypatch.setattr(cli, "get_backend", lambda name: backend())
     return runner.invoke(cli.app, args)
@@ -137,3 +173,75 @@ def test_missing_vendor(monkeypatch):
     r = invoke(monkeypatch, ["source-stability-check"], StableBackend)
     assert r.exit_code == 2
     assert "Missing option" in r.output
+
+
+def test_saturation_ideal(monkeypatch):
+    r = invoke(
+        monkeypatch,
+        [
+            "check-saturation",
+            "--vendor",
+            "fake",
+            "--exposures",
+            "5,10,40,80,160",
+        ],
+        SatIdealBackend,
+    )
+    assert r.exit_code == 0
+    assert "ideal" in r.output
+
+
+def test_saturation_too_bright(monkeypatch):
+    r = invoke(
+        monkeypatch,
+        [
+            "check-saturation",
+            "--vendor",
+            "fake",
+            "--exposures",
+            "10,20,40,80,160",
+        ],
+        SatTooBrightBackend,
+    )
+    assert r.exit_code == 1
+    assert "reduce intensity" in r.output
+    assert "x4.00" in r.output
+
+
+def test_saturation_too_dim(monkeypatch):
+    # slope 100 DN16/ms -> predicted onset at 65000/100 = 650 ms;
+    # target (3rd of 5) = 40 ms -> increase by x16.25
+    r = invoke(
+        monkeypatch,
+        [
+            "check-saturation",
+            "--vendor",
+            "fake",
+            "--exposures",
+            "5,10,40,80,160",
+        ],
+        SatDimBackend,
+    )
+    assert r.exit_code == 1
+    assert "increase intensity" in r.output
+    assert "x16.25" in r.output
+
+
+def test_saturation_no_signal(monkeypatch):
+    r = invoke(
+        monkeypatch,
+        ["check-saturation", "--vendor", "fake", "--exposures", "1,2,4"],
+        SatZeroSignalBackend,
+    )
+    assert r.exit_code == 1
+    assert "no usable signal" in r.output
+
+
+def test_saturation_descending_exposures_rejected(monkeypatch):
+    r = invoke(
+        monkeypatch,
+        ["check-saturation", "--vendor", "fake", "--exposures", "160,80,40"],
+        SatIdealBackend,
+    )
+    assert r.exit_code == 2
+    assert "ascending" in r.output

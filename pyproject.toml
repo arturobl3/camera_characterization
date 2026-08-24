@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Camera PTC characterization toolkit (EMVA 1288 / photon transfer)"
 requires-python = ">=3.11"
 dependencies = [
+    "ipython>=9.16.1",
     "matplotlib>=3.11.1",
     "numpy>=2.4.6",
     "pypdf>=6.16.1",

@@ -1,11 +1,12 @@
 """CLI entry point (Typer).
 
 Usage examples:
-  python -m camchar get-dark-frames --vendor playerone --exposures 100,500,1000,2000 --frames 20 --gain 0
-  python -m camchar get-flat-frames --vendor playerone --exposures 10,50,100 --frames 20 \\
-      --gain 0 --notes "green LED ~530nm, 30cm"
-  python -m camchar warmup-sensor --vendor basler
-  python -m camchar source-stability-check --vendor basler
+   python -m camchar get-dark-frames --vendor playerone --exposures 100,500,1000,2000 --frames 20 --gain 0
+   python -m camchar get-flat-frames --vendor playerone --exposures 10,50,100 --frames 20 \\
+       --gain 0 --notes "green LED ~530nm, 30cm"
+   python -m camchar warmup-sensor --vendor basler
+   python -m camchar source-stability-check --vendor basler
+   python -m camchar check-saturation --vendor basler
 
 --vendor (playerone | basler | thorlabs) is required on every acquisition
 command; analyze is offline and needs no vendor. Camera must be on and
@@ -28,6 +29,7 @@ import numpy as np
 import typer
 
 from .analyze import run as analyze_run
+from .analyze import SAT_CLIP_FRAC, SAT_MAX_DN
 from .backends import get_backend
 from .io_utils import camera_dir_name, save_sequence
 
@@ -49,6 +51,10 @@ WARMUP_PRINT_INTERVAL_S = 5.0
 SOURCE_STABILITY_EXPOSURES_MS = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
 SOURCE_STABILITY_FRAMES = 4
 SOURCE_STABILITY_TOL_PCT = 0.1
+# check-saturation: mean level treated as "about to clip" for the intensity
+# recommendation. A mean proxy by necessity -- with PRNU the pixel tails clip
+# before the mean reaches full scale.
+SAT_CHECK_PREDICT_DN16 = 65000.0
 
 app = typer.Typer(
     help="Camera PTC characterization toolkit (EMVA 1288 / photon transfer)",
@@ -337,6 +343,127 @@ def _source_stability_check(vendor, exposures_ms, frames, gain):
     return 0
 
 
+def _sat_verdict(first_sat_idx, t_first_sat_ms, exposures_ms, rows):
+    """Print the check-saturation verdict; return the process exit code.
+
+    Ideal setup: exactly the last 3 sweep exposures saturate. Anything else
+    gets a concrete intensity multiplier -- signal is linear in
+    intensity * exposure, so moving first saturation onto t_target means
+    scaling the light by t_target / t_first (or / t_predicted when nothing
+    saturated during the sweep). t_first_sat_ms is the *effective* exposure
+    of the first saturated frame (backends clamp to the camera range).
+    """
+    n = len(exposures_ms)
+    t_target = float(exposures_ms[-3])
+    if first_sat_idx is not None:
+        # the sweep stops at the first saturated exposure, so "only the last
+        # 3 exposures saturate" == that exposure is exactly exposures[-3]
+        if first_sat_idx == n - 3:
+            typer.secho(
+                "[saturation] verdict: ideal -- saturation begins exactly "
+                "at the third-to-last sweep exposure; keep this light "
+                "intensity",
+                fg=typer.colors.GREEN,
+                bold=True,
+            )
+            return 0
+        # signal is linear in intensity * exposure: first saturation at
+        # t_first means the light must scale by t_first/t_target to move the
+        # onset onto t_target (ratio > 1 -> too dim -> increase).
+        ratio = t_first_sat_ms / t_target
+        direction = "increase" if ratio > 1 else "reduce"
+        typer.secho(
+            f"[saturation] verdict: first saturation at {t_first_sat_ms:g} ms "
+            f"(effective), target ~{t_target:g} ms -> {direction} intensity "
+            f"by about x{max(ratio, 1.0 / ratio):.2f} so that only the last "
+            "3 exposures saturate",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        return 1
+
+    # nothing saturated during the sweep: extrapolate mean = slope * exposure
+    # through the origin and predict where clipping would begin
+    tt = np.array([r[0] for r in rows], dtype=np.float64)
+    mm = np.array([r[1] for r in rows], dtype=np.float64)
+    denom = float(np.sum(tt * tt))
+    if denom <= 0 or float(np.sum(tt * mm)) <= 0:
+        typer.secho(
+            "[saturation] verdict: no usable signal -- check illumination, "
+            "lens cap and the exposure range",
+            fg=typer.colors.RED,
+            bold=True,
+        )
+        return 1
+    slope = float(np.sum(tt * mm) / denom)  # DN16 per ms
+    t_pred = SAT_CHECK_PREDICT_DN16 / slope
+    ratio = t_pred / t_target
+    direction = "increase" if ratio > 1 else "reduce"
+    typer.secho(
+        f"[saturation] verdict: nothing saturates within the sweep "
+        f"(predicted onset ~{t_pred:.1f} ms, target ~{t_target:.1f} ms) -> "
+        f"{direction} intensity by about x{max(ratio, 1.0 / ratio):.2f}",
+        fg=typer.colors.RED,
+        bold=True,
+    )
+    return 1
+
+
+def _check_saturation(vendor, exposures_ms, gain):
+    backend = get_backend(vendor)
+    typer.secho(
+        f"[saturation] vendor={vendor}  opening camera...",
+        bold=True,
+        fg=typer.colors.CYAN,
+    )
+    info = backend.open()
+    typer.echo(
+        f"[saturation] camera: {info['model']} SN={info['serial']} "
+        f"sensor={info['sensor']} pixel={info['pixel_size_um']}um"
+    )
+    backend.configure(gain=gain)
+    temp = backend.sensor_temp_c()
+    typer.echo(f"[saturation] sensor temp: {temp:.1f} C, gain: {gain:g}")
+    typer.echo(
+        f"[saturation] 1 frame per exposure; saturated = >="
+        f" {SAT_CLIP_FRAC * 100:g}% of pixels at >= {SAT_MAX_DN} DN16 "
+        "(the same criterion analyze.py applies to PTC points); stopping at "
+        "the first saturated exposure"
+    )
+
+    rows = []  # (effective exposure ms, frame mean) of unsaturated points
+    first_sat_idx = None
+    first_sat_eff_ms = None
+    try:
+        for idx, exp_ms in enumerate(exposures_ms):
+            stack = backend.snap(exp_ms / 1000.0, 1)
+            eff_s = getattr(backend, "last_exposure_s", exp_ms / 1000.0)
+            frame = stack[0].astype(np.float64)
+            mean = float(frame.mean())
+            frac = float((frame >= SAT_MAX_DN).mean())
+            eff_ms = eff_s * 1000.0
+            clamped = "" if abs(eff_ms - exp_ms) <= 1e-9 else f" (eff {eff_ms:g})"
+            line = (
+                f"[saturation] exposure {exp_ms:g} ms{clamped}: mean "
+                f"{mean:10.1f}, clipped {100 * frac:6.3f}%"
+            )
+            if frac >= SAT_CLIP_FRAC:
+                first_sat_idx = idx
+                first_sat_eff_ms = eff_ms
+                typer.secho(line + "  <-- SATURATED", fg=typer.colors.YELLOW)
+                break
+            typer.echo(line)
+            rows.append((eff_ms, mean))
+    except KeyboardInterrupt:
+        typer.secho("\n[saturation] stopped by user", fg=typer.colors.YELLOW)
+        backend.close()
+        return 130
+
+    rc = _sat_verdict(first_sat_idx, first_sat_eff_ms, exposures_ms, rows)
+    backend.close()
+    return rc
+
+
 @app.command()
 def get_dark_frames(
     vendor: str = _vendor_option(),
@@ -444,6 +571,39 @@ def source_stability_check(
 ):
     """Check the light-source stability for flat-field measurements."""
     rc = _source_stability_check(vendor, exposures, frames, gain)
+    if rc:
+        raise typer.Exit(rc)
+
+
+@app.command()
+def check_saturation(
+    vendor: str = _vendor_option(),
+    exposures: str = typer.Option(
+        ",".join(map(str, DEFAULT_EXPOSURES_MS)),
+        parser=_parse_exposures_ms,
+        metavar="MS,MS,...",
+        show_default=False,
+        help="comma-separated exposure times in milliseconds; the sweep "
+        f"stops at the first saturated one (default: {_ms_list(DEFAULT_EXPOSURES_MS)})",
+    ),
+    gain: float = typer.Option(
+        0.0, help="fixed gain (dB for basler, integer index for playerone/thorlabs)"
+    ),
+):
+    """Find where flat-field saturation begins (light-intensity setup aid).
+
+    Records 1 frame per exposure and stops at the first one whose clipped
+    pixel fraction trips the EMVA saturation criterion. Ideal flat setup:
+    only the last 3 sweep exposures saturate -- the verdict prints the exact
+    intensity multiplier to get there.
+    """
+    if len(exposures) < 3:
+        raise typer.BadParameter("--exposures needs at least 3 values")
+    if any(b <= a for a, b in zip(exposures, exposures[1:])):
+        # the verdict logic (and the "last 3" target) assumes an ascending
+        # sweep; silently sorting would hide the mistake from the user
+        raise typer.BadParameter("--exposures must be strictly ascending")
+    rc = _check_saturation(vendor, exposures, gain)
     if rc:
         raise typer.Exit(rc)
 
