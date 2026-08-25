@@ -280,7 +280,9 @@ class ThorlabsBackend(CameraBackend):
             n_frames, 1
         )
         stack = np.empty((n_frames, self._h, self._w), dtype=np.uint16)
-        cam.arm(n_frames)
+        # arm(1) is rejected by this camera family ("number_of_frames_to_buffer
+        # Invalid operation" on the LP126CU); always allocate a spare buffer
+        cam.arm(max(int(n_frames), 2))
         try:
             for i in range(n_frames):
                 cam.issue_software_trigger()

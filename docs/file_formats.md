@@ -123,6 +123,10 @@ so:
   with `"Bayer"`), the DSNU/PRNU cores pool the four CFA sub-lattices in the
   variance domain and print per-channel values (`R,G1,G2,B` labels follow the
   recorded layout).
+- **Per-channel results**: on Bayer datasets `analyze` additionally treats
+  each sub-lattice as an independent camera — console table + detail blocks,
+  `outputs/<camera>/cfa_parameters.csv`, and one curve per channel in the
+  `*_bands.png` plot variants (colors follow the physical channel).
 - Never switch a color model to its `Mono*` pixel formats for measurements:
   those outputs are interpolated (demosaiced / green-upsampled) and destroy
   both temporal and spatial noise statistics.

@@ -33,6 +33,29 @@ def _band_colors(n):
     return [colors[i % len(colors)] for i in range(max(n, 1))]
 
 
+def _curve_label(r):
+    """Legend name for a per-curve result: channel label when the result
+    carries one (CFA channels), else the SPECIM wavelength formatting."""
+    if r.get("label"):
+        return str(r["label"])
+    return rf"$\lambda$ {r['wl_nm']:.0f} nm"
+
+
+def _math_name(r):
+    """Math-mode subscript name: channel label when present, else wavelength
+    tag ('40nm'). Used inside $...$ subscripts (R^2, K, SNR_max, DR)."""
+    if r.get("label"):
+        return rf"\mathrm{{{r['label']}}}"
+    return rf"{r['wl_nm']:.0f}\mathrm{{nm}}"
+
+
+def _result_colors(results):
+    """Per-curve colors from the band palette, overridable via result
+    'plot_color' (CFA channels use their physical color)."""
+    palette = _band_colors(len(results))
+    return [r.get("plot_color") or c for r, c in zip(results, palette)]
+
+
 def save_dark_mean_plot(rows, out_dir, roi=None, camera=None):
     """Mean dark DN vs exposure with the dark-current linear fit.
 
@@ -185,12 +208,17 @@ def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
     """Mean DN (bias-subtracted) vs exposure with a linear fit.
 
     rows is a list of (exposure_s, stats) from analyze_flats, stats['mean'] in
-    DN16. The fit uses unclipped points only (mean < clip_dn); saturated points
-    are drawn but excluded. Saves linearity_mean_vs_exposure.png.
+    DN16. The fit uses unclipped points only: mean < clip_dn AND sat_frac
+    within the EMVA limit -- a majority-pinned point can sit below clip_dn
+    while carrying no real signal. Saturated points are drawn but excluded.
+    Saves linearity_mean_vs_exposure.png.
     """
+    from .analyze import SAT_CLIP_FRAC  # local: avoid import cycle
+
     x = np.array([e for e, _ in rows]) * 1000
     y = np.array([s["mean"] for _, s in rows])
-    fit_mask = y < clip_dn
+    sat = np.array([s["sat_frac"] for _, s in rows])
+    fit_mask = (y < clip_dn) & (sat <= SAT_CLIP_FRAC)
     if fit_mask.sum() < 2:
         typer.secho(
             "  ! too few unclipped points for linearity plot", fg=typer.colors.YELLOW
@@ -488,7 +516,7 @@ def save_dark_plot_bands(sel_results, out_dir, roi=None, camera=None):
     fig, ax = plt.subplots(figsize=(8, 5))
     drew = False
     n_box = 0
-    for color, r in zip(_band_colors(len(sel_results)), sel_results):
+    for color, r in zip(_result_colors(sel_results), sel_results):
         rows = r["dark_rows"]
         if len(rows) < 2:
             continue
@@ -506,7 +534,7 @@ def save_dark_plot_bands(sel_results, out_dir, roi=None, camera=None):
             "o",
             ms=5,
             color=color,
-            label=rf"$\lambda$ {r['wl_nm']:.0f} nm",
+            label=_curve_label(r),
         )
         ax.plot(xl, slope * xl + intercept, "-", lw=1.5, color=color)
         r2_txt = rf"$R^2 = {r2:.4f}$" if np.isfinite(r2) else r"$R^2 = \text{--}$"
@@ -514,7 +542,7 @@ def save_dark_plot_bands(sel_results, out_dir, roi=None, camera=None):
             ax.text(
                 0.03,
                 0.97 - 0.16 * n_box,
-                rf"$\lambda$ {r['wl_nm']:.0f} nm:  "
+                rf"{_curve_label(r)}:  "
                 rf"$\mu_{{y,\mathrm{{dark}}}} = {slope:.4g}\,t {intercept:+.2f}$ DN16"
                 "\n"
                 rf"{r2_txt}  $\cdot$  bias = {intercept:.2f} DN16  $\cdot$  "
@@ -567,7 +595,7 @@ def save_dark_variance_plot_bands(sel_results, out_dir, roi=None, camera=None):
     fig, ax = plt.subplots(figsize=(8, 5))
     drew = False
     n_box = 0
-    for color, r in zip(_band_colors(len(sel_results)), sel_results):
+    for color, r in zip(_result_colors(sel_results), sel_results):
         rows = r["dark_rows"]
         if len(rows) < 2:
             continue
@@ -580,7 +608,7 @@ def save_dark_variance_plot_bands(sel_results, out_dir, roi=None, camera=None):
             "o",
             ms=5,
             color=color,
-            label=rf"$\lambda$ {r['wl_nm']:.0f} nm",
+            label=_curve_label(r),
         )
         ax.semilogx(x, y_nf, "s", ms=4, alpha=0.7, color=color)
         slope, offset = np.polyfit(x, y, 1)
@@ -602,7 +630,7 @@ def save_dark_variance_plot_bands(sel_results, out_dir, roi=None, camera=None):
         extras = r.get("extras")
         dsnu = extras["dsnu1288_dn"] if extras else None
         box_text = (
-            rf"$\lambda$ {r['wl_nm']:.0f} nm:  "
+            rf"{_curve_label(r)}:  "
             rf"$\sigma_y^2 = {slope:.4g}\,t {offset:+.2f}$ DN16$^2$"
             "\n"
             rf"{r2_txt}  $\cdot$  "
@@ -655,21 +683,27 @@ def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=No
 
     Linear scales: within one band the signal spans only the exposure grid
     (the log-log span argument applies across the spectrum, not per band).
-    Saturated points are marked x and excluded from the curve and the fit.
+    Saturated points are marked x and excluded from the curve and the fit --
+    both above-clip points and majority-pinned ones whose mean still sits
+    below clip_dn (EMVA sat_frac limit, same rule as the PTC fit).
     Each band's legend entry carries its linear fit mu = a*t + b (on the
     unclipped points) and the (centered) R^2. Saves
     linearity_mean_vs_exposure_bands.png.
     """
+    from .analyze import SAT_CLIP_FRAC  # local: avoid import cycle
+
     fig, ax = plt.subplots(figsize=(8, 5))
     drew = False
-    for color, r in zip(_band_colors(len(sel_results)), sel_results):
+    for color, r in zip(_result_colors(sel_results), sel_results):
         if not r["flat_rows"] or not r["dark"]:
             continue
         rows = r["flat_rows"]
         bias = r["dark"]["bias_dn"]
         x = np.array([e for e, _ in rows]) * 1000
-        y = np.array([s["mean"] for _, s in rows]) - bias
-        m = (y > 0) & (np.array([s["mean"] for _, s in rows]) < clip_dn)
+        means = np.array([s["mean"] for _, s in rows])
+        y = means - bias
+        sat = np.array([s["sat_frac"] for _, s in rows])
+        m = (y > 0) & (means < clip_dn) & (sat <= SAT_CLIP_FRAC)
         if m.sum() < 2:
             continue
         ax.plot(
@@ -696,7 +730,7 @@ def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=No
             lw=1.2,
             color=color,
             label=(
-                rf"$\lambda$ {r['wl_nm']:.0f} nm: "
+                rf"{_curve_label(r)}: "
                 rf"$\mu = {a:.6g}\,t {b:+.2f}$" + (f", {r2_txt}" if r2_txt else "")
             ),
         )
@@ -748,7 +782,7 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
     capped_any = False
     first_bias = None
     r2_entries, k_entries = [], []
-    for color, r in zip(_band_colors(len(sel_results)), sel_results):
+    for color, r in zip(_result_colors(sel_results), sel_results):
         f = r["flat"]
         if not f:
             continue
@@ -761,16 +795,16 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         m = (x <= cap) & (x < clip_dn) & (v > 0)
         if m.sum() < 2:
             continue
-        wl = rf"{r['wl_nm']:.0f}\mathrm{{nm}}"
-        r2_entries.append(rf"$R^2_{{{wl}}} = {f['ptc_r2']:.4f}$")
-        k_entries.append(rf"$K_{{{wl}}} = {f['K12']:.2f}$")
+        nm = _math_name(r)
+        r2_entries.append(rf"$R^2_{{{nm}}} = {f['ptc_r2']:.4f}$")
+        k_entries.append(rf"$K_{{{nm}}} = {f['K12']:.2f}$")
         ax.loglog(
             x[m] - bias,
             v[m],
             "o",
             ms=5,
             color=color,
-            label=rf"$\lambda$ {r['wl_nm']:.0f} nm",
+            label=_curve_label(r),
         )
         ab = (x > cap) & (x < clip_dn) & (v > 0)
         if ab.any():
@@ -888,7 +922,7 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
     snr_max_entries = []
     mu_min_entries = []
     dr_entries = []
-    for color, r in zip(_band_colors(len(sel_results)), sel_results):
+    for color, r in zip(_result_colors(sel_results), sel_results):
         f = r["flat"]
         if not f or not r["dark_rows"]:
             continue
@@ -900,9 +934,7 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
             continue
         signal = (means[m] - f["bias_dn"]) * f["K12"] / 16.0
         snr = (means[m] - f["bias_dn"]) / np.sqrt(tvars[m])
-        ax.loglog(
-            signal, snr, "+", ms=6, color=color, label=rf"$\lambda$ {r['wl_nm']:.0f} nm"
-        )
+        ax.loglog(signal, snr, "+", ms=6, color=color, label=_curve_label(r))
         sc = np.linspace(signal.min(), signal.max(), 100)
         ax.loglog(
             sc,
@@ -931,17 +963,18 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
             drew_total = True
         sig_lo.append(signal.min())
         sig_hi.append(signal.max())
+        nm = _math_name(r)
         snr_max_entries.append(
-            rf"$\mathrm{{SNR}}_{{\max,\,{r['wl_nm']:.0f}\mathrm{{nm}}}}"
+            rf"$\mathrm{{SNR}}_{{\max,\,{nm}}}"
             rf" = {np.sqrt(f['Nsat']):.1f}$"
         )
         if extras:
             mu_min_entries.append(
-                rf"$\mu_{{e,\mathrm{{min}},\,{r['wl_nm']:.0f}\mathrm{{nm}}}}"
+                rf"$\mu_{{e,\mathrm{{min}},\,{nm}}}"
                 rf" = {extras['mu_min_e']:.2f}$"
             )
             dr_entries.append(
-                rf"$\mathrm{{DR}}_{{{r['wl_nm']:.0f}\mathrm{{nm}}}}"
+                rf"$\mathrm{{DR}}_{{{nm}}}"
                 rf" = {extras['dr']:.0f}$"
             )
         drew = True

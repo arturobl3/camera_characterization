@@ -255,7 +255,11 @@ Color models (tested: LP126CU) work through the same path: the SDK delivers
 **raw right-aligned Bayer** (no demosaicing — its color processor is opt-in
 and unused), `metadata.json` records `pixel_format` (e.g. `"BayerBG12"` for
 the LP126CU, whose origin pixel is blue), and `analyze` automatically pools
-the CFA sub-lattices for DSNU/PRNU like on Basler color models.
+the CFA sub-lattices for DSNU/PRNU like on Basler color models. On Bayer
+datasets `analyze` additionally runs a **per-channel pass** (SPECIM-style):
+every CFA sub-lattice goes through the same fits independently, giving one
+curve per channel (R/G1/G2/B) in the `*_bands.png` plot variants plus
+`cfa_parameters.csv` — additive to the pooled headline numbers.
 
 Full SDK distribution (docs, installers, examples) lives untracked under
 `Scientific Camera Interfaces/`.

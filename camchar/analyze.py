@@ -900,6 +900,13 @@ def run(data_dir, roi=None, bands=5):
             save_ptc_plot(flat, dk, out_dir, CLIP_DN, roi, camera)
             save_snr_plot(flat, out_dir, CLIP_DN, roi, camera)
 
+        if bayer_format:
+            # additive per-channel pass: every Bayer sub-lattice through the
+            # same fits, one curve per channel in the *_bands plot variants
+            from .cfa_analyze import run as cfa_run  # local: avoid import cycle
+
+            cfa_run(cam_dir, dark_seq, flat_seq, bayer_format, roi, camera=camera)
+
 
 def main(argv=None):
     p = argparse.ArgumentParser(

@@ -456,11 +456,12 @@ def _check_saturation(vendor, exposures_ms, gain):
             rows.append((eff_ms, mean))
     except KeyboardInterrupt:
         typer.secho("\n[saturation] stopped by user", fg=typer.colors.YELLOW)
-        backend.close()
         return 130
+    finally:
+        # always release the camera, even when snap() raises mid-sweep
+        backend.close()
 
     rc = _sat_verdict(first_sat_idx, first_sat_eff_ms, exposures_ms, rows)
-    backend.close()
     return rc
 
 
