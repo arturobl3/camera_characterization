@@ -17,6 +17,7 @@ import numpy as np
 import typer
 
 from . import analyze
+from . import report
 from .analyze import (
     CLIP_DN,
     _cfa_labels,
@@ -56,9 +57,7 @@ def _extras_for_channel(dark_seq_c, flat_seq_c, dk, flat_fit, roi_slices):
     runs with cfa=False.
     """
     rows = flat_fit["rows"]
-    ok = [rs for rs in rows if rs[1]["sat_frac"] <= analyze.SAT_CLIP_FRAC]
-    if not ok:
-        ok = [rs for rs in rows if rs[1]["mean"] < CLIP_DN]
+    ok, _ = analyze.usable_flat_points(rows)
     if not ok or not dark_seq_c:
         return None
     mu_sat = max(s["mean"] for _, s in ok)
@@ -133,115 +132,25 @@ def _analyze_channel(label, i, j, dark_seq, flat_seq, roi_slices):
 
 
 def _print_table(results):
-    print("\n=== PER-CFA-CHANNEL PARAMETERS (K/sigma_r in e-; DN = DN16) ===")
-    print(
-        f"{'ch':>4} {'K12':>6} {'K12nf':>6} {'sig_r':>6} "
-        f"{'sr_q':>6} {'d.cur':>8} {'DSNU':>6} {'PRNU':>6} {'Nsat':>7} "
-        f"{'DR':>6}  status"
+    report.print_param_table(
+        results,
+        "\n=== PER-CFA-CHANNEL PARAMETERS (K/sigma_r in e-; DN = DN16) ===",
+        f"{'ch':>4} ",
+        lambda r: f"{r['label']:>4} ",
     )
-    for r in results:
-        f, x, dk = r["flat"], r["extras"], r["dark"]
-        if not f or not dk:
-            print(
-                f"{r['label']:>4} {'-':>6} {'-':>6} {'-':>6} {'-':>6} {'-':>8} "
-                f"{'-':>6} {'-':>6} {'-':>7} {'-':>6}  {r['status']}"
-            )
-            continue
-        ok = np.isfinite(f["K12"]) and f["K12"] > 0
-        ok_nf = np.isfinite(f["K12_nf"]) and f["K12_nf"] > 0
-        tail = (
-            "      -      -      -      -"
-            if x is None or not ok
-            else (
-                f" {x['dsnu1288_dn']:6.2f} {x['prnu1288_pct']:6.2f} "
-                f"{x['nsat_e']:7.0f} {x['dr']:6.0f}"
-            )
-        )
-        print(
-            f"{r['label']:>4} "
-            + (f"{f['K12']:6.2f} " if ok else f"{'-':>6} ")
-            + (f"{f['K12_nf']:6.2f} " if ok_nf else f"{'-':>6} ")
-            + (
-                f"{f['sigma_r_e']:6.2f} {f['sigma_r_e_q']:6.2f} "
-                if ok
-                else f"{'-':>6} {'-':>6} "
-            )
-            + f"{dk['dark_current_dn_per_s']:8.2f}"
-            + tail
-            + f"  {r['status']}"
-        )
 
 
 def _print_channel_detail(r):
-    dk, f, x = r["dark"], r["flat"], r["extras"]
-    print(f"\n-- channel {r['label']} --")
-    if not dk:
-        print(f"  {r['status']}")
-        return
-    print(
-        f"  bias {dk['bias_dn']:.2f} DN16; dark current "
-        f"{dk['dark_current_dn_per_s']:.4f} DN16/s "
-        f"(var {dk['dark_current_var_dn2_per_s']:.2f} DN16^2/s; "
-        f"nf {dk['dark_current_var_dn2_per_s_nf']:.2f})"
+    report.print_curve_detail(
+        r.get("dark"),
+        r.get("flat"),
+        r.get("extras"),
+        r["status"],
+        f"\n-- channel {r['label']} --",
     )
-    print(
-        f"  sigma_r (Eq. 30) {dk['sigma_r_dn']:.2f} DN16 "
-        f"(short-exposure median {dk['sigma_r_median_dn']:.2f})"
-    )
-    if not f:
-        return
-    if "degenerate" in r["status"]:
-        print(
-            f"  ! degenerate PTC fit (two-frame slope {f['ptc_slope']:.3f} <= 0): "
-            "even the adjacent-pair variance is bent -- check the data"
-        )
-    print(
-        f"  K (two-frame) = {f['K12']:.2f} e-/DN12 (N-frame {f['K12_nf']:.2f}, "
-        f"{100 * (f['K12_nf'] - f['K12']) / f['K12']:+.1f}%); "
-        f"PTC R2 = {f['ptc_r2']:.6f}"
-    )
-    print(
-        f"  sigma_r = {f['sigma_r_e']:.2f} e- (nf {f['sigma_r_nf_e']:.2f}; "
-        f"Eq. 53 quant-corrected {f['sigma_r_e_q']:.2f} e-)"
-    )
-    print(f"  Nsat (PTC, 4094 clip) = {f['Nsat']:.0f} e-")
-    if x:
-        print(
-            f"  mu_y.sat = {x['mu_sat_dn']:.0f} DN16; Nsat (EMVA) = "
-            f"{x['nsat_e']:.0f} e-; DR = {x['dr']:.0f} ({x['dr_db']:.1f} dB)"
-        )
-        print(
-            f"  PRNU1288 = {x['prnu1288_pct']:.2f} %; "
-            f"DSNU1288 = {x['dsnu1288_dn']:.2f} DN16"
-        )
 
 
-_CSV_SOURCE_COLUMNS = [
-    "status",
-    "K12_e_per_DN12",
-    "K12_nf_e_per_DN12",
-    "ptc_r2",
-    "sigma_r_e",
-    "sigma_r_e_q",
-    "sigma_r_nf_e",
-    "sigma_r_nf_e_q",
-    "bias_dn16",
-    "sigma_r_dn16",
-    "sigma_r_median_dn16",
-    "dark_current_dn16_per_s",
-    "dark_current_var_dn16_2_per_s",
-    "dark_current_var_dn16_2_per_s_nf",
-    "prnu_quick_pct",
-    "mu_sat_dn16",
-    "nsat_emva_e",
-    "nsat_ptc_e",
-    "mu_min_e",
-    "dynamic_range",
-    "dynamic_range_db",
-    "prnu1288_pct",
-    "dsnu1288_dn16",
-]
-_COLUMNS = ["channel", *_CSV_SOURCE_COLUMNS]
+_COLUMNS = ["channel", "status", *report.PARAM_COLUMNS]
 
 
 def _write_csv(results, path):
@@ -251,54 +160,16 @@ def _write_csv(results, path):
         w = csv.writer(fh)
         w.writerow(_COLUMNS)
         for r in results:
-            f, x, dk = r.get("flat"), r.get("extras"), r.get("dark")
             row = {"channel": r["label"], "status": r["status"]}
-            if dk:
-                row.update(
-                    {
-                        "bias_dn16": f"{dk['bias_dn']:.2f}",
-                        "sigma_r_dn16": f"{dk['sigma_r_dn']:.3f}",
-                        "sigma_r_median_dn16": f"{dk['sigma_r_median_dn']:.3f}",
-                        "dark_current_dn16_per_s": f"{dk['dark_current_dn_per_s']:.4f}",
-                        "dark_current_var_dn16_2_per_s": f"{dk['dark_current_var_dn2_per_s']:.3f}",
-                        "dark_current_var_dn16_2_per_s_nf": (
-                            f"{dk['dark_current_var_dn2_per_s_nf']:.3f}"
-                        ),
-                    }
-                )
-            if f:
-                row.update(
-                    {
-                        "K12_e_per_DN12": f"{f['K12']:.4f}",
-                        "K12_nf_e_per_DN12": f"{f['K12_nf']:.4f}",
-                        "ptc_r2": f"{f['ptc_r2']:.6f}",
-                        "sigma_r_e": f"{f['sigma_r_e']:.4f}",
-                        "sigma_r_e_q": f"{f['sigma_r_e_q']:.4f}",
-                        "sigma_r_nf_e": f"{f['sigma_r_nf_e']:.4f}",
-                        "sigma_r_nf_e_q": f"{f['sigma_r_nf_e_q']:.4f}",
-                        "nsat_ptc_e": f"{f['Nsat']:.1f}",
-                        "prnu_quick_pct": (
-                            f"{f['prnu_pct']:.3f}" if f["prnu_pct"] is not None else ""
-                        ),
-                    }
-                )
-            if x:
-                row.update(
-                    {
-                        "mu_sat_dn16": f"{x['mu_sat_dn']:.1f}",
-                        "nsat_emva_e": f"{x['nsat_e']:.1f}",
-                        "mu_min_e": f"{x['mu_min_e']:.3f}",
-                        "dynamic_range": f"{x['dr']:.1f}",
-                        "dynamic_range_db": f"{x['dr_db']:.2f}",
-                        "prnu1288_pct": f"{x['prnu1288_pct']:.3f}",
-                        "dsnu1288_dn16": f"{x['dsnu1288_dn']:.3f}",
-                    }
-                )
+            if r.get("dark"):
+                row.update(report.csv_dark_cells(r["dark"]))
+            row.update(report.csv_flat_cells(r.get("flat")))
+            row.update(report.csv_extras_cells(r.get("extras")))
             w.writerow([row.get(c, "") for c in _COLUMNS])
     typer.secho(f"  [csv] saved {path}", fg=typer.colors.GREEN)
 
 
-def run(cam_dir, dark_seq, flat_seq, bayer_format, roi, camera=None):
+def run(cam_dir, dark_seq, flat_seq, bayer_format, roi, camera=None, roi_label=None):
     labels = _cfa_labels(bayer_format)
     phases = list(zip(labels, (0, 0, 1, 1), (0, 1, 0, 1)))
     roi_slices = tuple(slice(a, b) for a, b in zip(roi[0::2], roi[1::2]))
@@ -312,39 +183,18 @@ def run(cam_dir, dark_seq, flat_seq, bayer_format, roi, camera=None):
         for label, i, j in phases
     ]
     _print_table(results)
+    report.check_drift_and_degenerate(results, "channels")
 
-    gaps = [
-        abs(r["flat"]["K12_nf"] - r["flat"]["K12"]) / r["flat"]["K12"]
-        for r in results
-        if r["flat"]
-        and np.isfinite(r["flat"]["K12"])
-        and r["flat"]["K12"] > 0
-        and np.isfinite(r["flat"]["K12_nf"])
-        and r["flat"]["K12_nf"] > 0
-    ]
-    n_degen = sum(1 for r in results if "degenerate" in r["status"])
-    if n_degen:
-        print(
-            f"  ! {n_degen} channels with non-positive two-frame PTC slope "
-            f"(saturation-collapsed variance) -- check the data"
-        )
-    if gaps:
-        med = float(np.median(gaps))
-        flag = "  ! " if med > 0.01 else "  "
-        print(
-            f"{flag}N-frame vs two-frame K across channels: median "
-            f"|K_nf-K|/K = {med * 100:.2f}% "
-            f"({'>1% -- drift between acquisitions' if med > 0.01 else 'ok'})"
-        )
-
-    print("\n=== EMVA DETAIL (per CFA channel) ===")
+    typer.secho(
+        "\n=== EMVA DETAIL (per CFA channel) ===", bold=True, fg=typer.colors.CYAN
+    )
     for r in results:
         _print_channel_detail(r)
 
     out_dir = Path("outputs") / Path(cam_dir).name
     _write_csv(results, out_dir / "cfa_parameters.csv")
-    save_dark_plot_bands(results, out_dir, camera=camera)
-    save_dark_variance_plot_bands(results, out_dir, camera=camera)
-    save_linearity_plot_bands(results, out_dir, CLIP_DN, camera=camera)
-    save_ptc_plot_bands(results, out_dir, CLIP_DN, camera=camera)
-    save_snr_plot_bands(results, out_dir, CLIP_DN, camera=camera)
+    save_dark_plot_bands(results, out_dir, roi_label, camera=camera)
+    save_dark_variance_plot_bands(results, out_dir, roi_label, camera=camera)
+    save_linearity_plot_bands(results, out_dir, CLIP_DN, roi_label, camera=camera)
+    save_ptc_plot_bands(results, out_dir, CLIP_DN, roi_label, camera=camera)
+    save_snr_plot_bands(results, out_dir, CLIP_DN, roi_label, camera=camera)

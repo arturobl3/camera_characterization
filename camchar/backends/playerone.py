@@ -88,7 +88,6 @@ class PlayerOneBackend(CameraBackend):
         self._info = None
         self._buf = None
         self._w = self._h = 0
-        self._closed = False
 
     # ---------- lifecycle ----------
     def open(self):
@@ -195,4 +194,3 @@ class PlayerOneBackend(CameraBackend):
         """No-op on purpose: calling CloseCamera() on macOS wedges the device for
         the next process (needs a physical replug to recover). Process exit is the
         cleanup. See module docstring."""
-        self._closed = True

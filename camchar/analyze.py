@@ -20,14 +20,20 @@ Math (validated against Sony IMX174, see camera-noise-characterization skill):
     follow the equations cited inline.
 """
 
-import argparse
 import json
 from pathlib import Path
 
 import numpy as np
 import typer
 
-from .io_utils import camera_dir_name, stem_for
+from .io_utils import (
+    DEFAULT_ROI_FRAC,
+    DEFAULT_ROI_SPECIM,
+    SAT_CLIP_FRAC,
+    camera_dir_name,
+    central_roi,
+    stem_for,
+)
 from .plots import (
     save_dark_mean_plot,
     save_dark_variance_plot,
@@ -41,16 +47,10 @@ DARK_CURRENT_FLAT_MAX_EXP = (
     0.01  # exposures <= 10 ms: dark-current shot noise negligible
 )
 SAT_MAX_DN = 65504  # sensor digital maximum (12-bit 4094 << 4)
-SAT_CLIP_FRAC = 0.002  # EMVA R4 Linear 6.6: saturation = <= 0.2% pixels at max
 PTC_FIT_SAT_FRAC = (
     0.7  # EMVA R4 Linear PTC regression range: minimum value to 70% saturation
 )
 QUANT_STEP_DN16 = 16.0  # DN16 per 12-bit LSB (DN12 << 4 storage)
-
-# playerone Apollo-M central 400x400
-DEFAULT_ROI = (500, 900, 750, 1150)
-# SPECIM IQ ROI region, see uniformity plot and adjust if needed
-DEFAULT_ROI_SPECIM = (140, 290, 156, 306)
 
 _VENDOR_NAMES = {
     "playerone": "Player One",
@@ -301,6 +301,20 @@ def roi_stats(stack, roi):
     }
 
 
+def usable_flat_points(rows):
+    """Flat rows usable for the EMVA-extras point selection (pure).
+
+    Primary rule: sat_frac <= SAT_CLIP_FRAC (EMVA 6.6 -- a majority-pinned
+    point carries no variance). When no row passes, fall back to all rows
+    below the clip mean (data that never saturates properly). Returns
+    (subset, used_fallback).
+    """
+    ok = [rs for rs in rows if rs[1]["sat_frac"] <= SAT_CLIP_FRAC]
+    if ok:
+        return ok, False
+    return [rs for rs in rows if rs[1]["mean"] < CLIP_DN], True
+
+
 def fit_dark_stats(rows):
     """Eq. 29/30 dark fits from roi_stats rows [(exposure_s, stats)] (pure).
 
@@ -316,7 +330,7 @@ def fit_dark_stats(rows):
     tvars = np.array([s["tvar"] for _, s in rows])
     tf_tvars = np.array([s["tf_tvar"] for _, s in rows])
 
-    slope, intercept = np.polyfit(t, mu, 1)  # Eq. 29: mu_d = mu_d0 + mu_I.y t
+    slope = np.polyfit(t, mu, 1)[0]  # Eq. 29: mu_d = mu_d0 + mu_I.y t
     tf_var_slope, tf_var_offset = np.polyfit(t, tf_tvars, 1)  # Eq. 30 (two-frame)
     nf_var_slope, nf_var_offset = np.polyfit(t, tvars, 1)  # N-frame cross-check
     short = t <= DARK_CURRENT_FLAT_MAX_EXP
@@ -332,11 +346,10 @@ def fit_dark_stats(rows):
         "sigma_r_dn": float(np.sqrt(max(tf_var_offset, 0.0))),
         "sigma_r_nf_dn": float(np.sqrt(max(nf_var_offset, 0.0))),
         "sigma_r_median_dn": sigma_r_med,
-        "bias_fit_dn": float(intercept),
     }
 
 
-def analyze_dark(seq):
+def analyze_dark(seq, roi):
     """Bias floor, dark current, read noise from dark frames."""
     typer.secho(
         "=== DARK (tf = two-frame primary; nf = N-frame cross-check) ===",
@@ -347,7 +360,7 @@ def analyze_dark(seq):
         return None
     rows = []
     for exp_s, st in seq:
-        s = roi_stats(st, ROI)
+        s = roi_stats(st, roi)
         rows.append((exp_s, s))
         typer.echo(
             f"  {exp_s * 1000:8.1f} ms  mean {s['mean']:8.2f}  "
@@ -493,7 +506,6 @@ def fit_flat_stats(rows, dark):
         "ptc_intercept": 0.0,  # Eq. 50 zero-intercept fit on the dark-subtracted variance
         "ptc_intercept_free": b_free,  # sanity check: ~0 for a valid PTC
         "ptc_slope_nf": K_fit_nf,
-        "ptc_intercept_nf": 0.0,
         "ptc_r2": ptc_r2,
         "mu_sat_dn": mu_sat,
         "ptc_sat_70_dn": cap if capped else mu_sat,
@@ -505,7 +517,7 @@ def fit_flat_stats(rows, dark):
     }
 
 
-def analyze_flats(seq, dark):
+def analyze_flats(seq, dark, roi):
     """K, Nsat, PRNU from the flat sweep (temporal variance)."""
     typer.secho(
         "\n=== FLAT (tf = two-frame primary; nf = N-frame cross-check) ===",
@@ -516,7 +528,7 @@ def analyze_flats(seq, dark):
         return None
     rows = []
     for exp_s, st in seq:
-        s = roi_stats(st, ROI)
+        s = roi_stats(st, roi)
         rows.append((exp_s, s))
         typer.echo(
             f"  {exp_s * 1000:8.1f} ms  mean {s['mean']:10.2f}  "
@@ -644,11 +656,7 @@ def emva_extras_core(
     With cfa=True the Bayer sub-lattices are pooled in the variance domain
     (see dsnu1288_core) and per-phase values are returned alongside.
     """
-    rows = flat["rows"]
-    ok = [rs for rs in rows if rs[1]["sat_frac"] <= SAT_CLIP_FRAC]
-    fallback = not ok
-    if not ok:
-        ok = [rs for rs in rows if rs[1]["mean"] < CLIP_DN]
+    ok, fallback = usable_flat_points(flat["rows"])
     if not ok:
         return None
     mu_sat = flat["mu_sat_dn"]  # same saturation point that bounds the PTC fit
@@ -708,7 +716,7 @@ def emva_extras_core(
     return out
 
 
-def emva1288_extras(dark_seq, flat_seq, dk, flat, cfa=False, cfa_labels=None):
+def emva1288_extras(dark_seq, flat_seq, dk, flat, roi, cfa=False, cfa_labels=None):
     """EMVA R4 Linear extras: saturation (6.6), DR (Eq. 28), PRNU1288/DSNU1288.
 
     PRNU/DSNU use the Section 8.1 highpass (7x7 + 11x11 box then 3x3 binomial,
@@ -726,26 +734,24 @@ def emva1288_extras(dark_seq, flat_seq, dk, flat, cfa=False, cfa_labels=None):
         fg=typer.colors.CYAN,
     )
     rows = flat["rows"]
-    ok = [rs for rs in rows if rs[1]["sat_frac"] <= SAT_CLIP_FRAC]
-    if not ok:
+    ok, fallback = usable_flat_points(rows)
+    if fallback and ok:
         typer.secho(
             "  ! no point under the clip-fraction limit -- using max unclipped",
             fg=typer.colors.YELLOW,
         )
-    if not ok and not [rs for rs in rows if rs[1]["mean"] < CLIP_DN]:
+    if not ok:
         typer.secho("  ! no usable points", fg=typer.colors.YELLOW)
         return
 
     d_stack = min(dark_seq, key=lambda es: es[0])[1]
     dark_tvar = dk["rows"][0][1]["tf_tvar"]
-    mu_sat_max = max(
-        s["mean"] for _, s in (ok or [rs for rs in rows if rs[1]["mean"] < CLIP_DN])
-    )
+    mu_sat_max = max(s["mean"] for _, s in ok)
     target = 0.5 * (mu_sat_max + dk["bias_dn"])
     idx = min(range(len(rows)), key=lambda i: abs(rows[i][1]["mean"] - target))
     f_exp, f_stack = flat_seq[idx]
-    d_img = d_stack[:, ROI[0], ROI[1]].astype(np.float64).mean(axis=0)
-    f_img = f_stack[:, ROI[0], ROI[1]].astype(np.float64).mean(axis=0)
+    d_img = d_stack[:, roi[0], roi[1]].astype(np.float64).mean(axis=0)
+    f_img = f_stack[:, roi[0], roi[1]].astype(np.float64).mean(axis=0)
 
     x = emva_extras_core(
         dk,
@@ -846,18 +852,28 @@ def run(data_dir, roi=None, bands=5):
         run_bands(cam_dir, roi or DEFAULT_ROI_SPECIM, bands)
         return
 
-    global ROI
-    roi = roi or DEFAULT_ROI
-    ROI = tuple(slice(a, b) for a, b in zip(roi[0::2], roi[1::2]))
-
-    typer.secho(
-        f"Analyzing {cam_dir.resolve()}  (ROI rows {roi[0]}:{roi[1]}, "
-        f"cols {roi[2]}:{roi[3]})",
-        bold=True,
-        fg=typer.colors.CYAN,
-    )
     dark_seq = load_sequence(cam_dir, "dark")
-    dk = analyze_dark(dark_seq)
+    roi_label = None
+    if roi is None:
+        # Default ROI: central fraction of the recorded frames. Derived from
+        # the stacks themselves, not metadata.json -- append-only dirs can
+        # mix geometries (acA1920 pre/post Aug-2026).
+        ref = dark_seq or load_sequence(cam_dir, "flat")
+        if ref:
+            height, width = ref[0][1].shape[1:3]
+            roi = central_roi(width, height)
+            roi_label = f"central {DEFAULT_ROI_FRAC:.0%}"
+    else:
+        roi_label = f"rows {roi[0]}:{roi[1]}, cols {roi[2]}:{roi[3]}"
+    roi_slices = (
+        tuple(slice(a, b) for a, b in zip(roi[0::2], roi[1::2])) if roi else None
+    )
+
+    header = f"Analyzing {cam_dir.resolve()}"
+    if roi_label:
+        header += f"  (ROI {roi_label})"
+    typer.secho(header, bold=True, fg=typer.colors.CYAN)
+    dk = analyze_dark(dark_seq, roi_slices)
     meta = load_camera_meta(cam_dir)
     camera = load_camera_info(cam_dir)
     # Raw-Bayer datasets: spatial metrics pool the four CFA sub-lattices.
@@ -881,64 +897,52 @@ def run(data_dir, roi=None, bands=5):
             f"  read noise (Eq. 30 fit offset): {dk['sigma_r_dn']:.2f} DN16 "
             f"(short-exposure median {dk['sigma_r_median_dn']:.2f})"
         )
-        save_dark_mean_plot(dk["rows"], out_dir, roi, camera)
+        save_dark_mean_plot(dk["rows"], out_dir, roi_label, camera)
         d_stack = min(dark_seq, key=lambda es: es[0])[1]
-        d_img = d_stack[:, ROI[0], ROI[1]].astype(np.float64).mean(axis=0)
+        d_img = d_stack[:, roi_slices[0], roi_slices[1]].astype(np.float64).mean(axis=0)
         dsnu = dsnu1288_core(
             d_img, dk["rows"][0][1]["tf_tvar"], d_stack.shape[0], cfa=cfa
         )
-        save_dark_variance_plot(dk["rows"], out_dir, roi, camera, dsnu=dsnu)
+        save_dark_variance_plot(dk["rows"], out_dir, roi_label, camera, dsnu=dsnu)
         flat_seq = load_sequence(cam_dir, "flat")
-        flat = analyze_flats(flat_seq, dk)
+        if flat_seq and dark_seq:
+            fh, fw = flat_seq[0][1].shape[1:3]
+            dh, dw = dark_seq[0][1].shape[1:3]
+            if (fh, fw) != (dh, dw):
+                typer.secho(
+                    f"  ! dark ({dh}x{dw}) and flat ({fh}x{fw}) frame sizes "
+                    "differ (append-only dir with mixed geometries?) -- the "
+                    "ROI may cover different physical regions",
+                    fg=typer.colors.YELLOW,
+                )
+        flat = analyze_flats(flat_seq, dk, roi_slices)
         if flat:
             flat["extras"] = emva1288_extras(
-                dark_seq, flat_seq, dk, flat, cfa=cfa, cfa_labels=cfa_labels
+                dark_seq,
+                flat_seq,
+                dk,
+                flat,
+                roi_slices,
+                cfa=cfa,
+                cfa_labels=cfa_labels,
             )
             save_linearity_plot(
-                flat["rows"], flat["bias_dn"], out_dir, CLIP_DN, roi, camera
+                flat["rows"], flat["bias_dn"], out_dir, CLIP_DN, roi_label, camera
             )
-            save_ptc_plot(flat, dk, out_dir, CLIP_DN, roi, camera)
-            save_snr_plot(flat, out_dir, CLIP_DN, roi, camera)
+            save_ptc_plot(flat, dk, out_dir, CLIP_DN, roi_label, camera)
+            save_snr_plot(flat, out_dir, CLIP_DN, roi_label, camera)
 
         if bayer_format:
             # additive per-channel pass: every Bayer sub-lattice through the
             # same fits, one curve per channel in the *_bands plot variants
             from .cfa_analyze import run as cfa_run  # local: avoid import cycle
 
-            cfa_run(cam_dir, dark_seq, flat_seq, bayer_format, roi, camera=camera)
-
-
-def main(argv=None):
-    p = argparse.ArgumentParser(
-        prog="camchar analyze", description="Temporal PTC analysis of dark/flat data"
-    )
-    p.add_argument(
-        "--data",
-        default="data",
-        help="data root or camera dir <root>/<vendor>_<model>_(<sensor>); "
-        "a single camera dir under a root is auto-discovered (default: data)",
-    )
-    p.add_argument(
-        "--roi",
-        default=None,
-        help=f"ROI as r0:r1:c0:c1 (default {':'.join(map(str, DEFAULT_ROI))}; "
-        f"SPECIM IQ {':'.join(map(str, DEFAULT_ROI_SPECIM))})",
-    )
-    p.add_argument(
-        "--bands",
-        type=int,
-        default=5,
-        help="number of equispaced bands in per-band (SPECIM IQ) plots; "
-        "ignored for monochrome npy data (default 5)",
-    )
-    args = p.parse_args(argv)
-    roi = None
-    if args.roi is not None:
-        roi = [int(x) for x in args.roi.split(":")]
-        if len(roi) != 4:
-            p.error("--roi must be r0:r1:c0:c1")
-    run(args.data, roi, args.bands)
-
-
-if __name__ == "__main__":
-    main()
+            cfa_run(
+                cam_dir,
+                dark_seq,
+                flat_seq,
+                bayer_format,
+                roi,
+                camera=camera,
+                roi_label=roi_label,
+            )

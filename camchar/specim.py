@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import spectral.io.envi as envi
+import typer
 
 DARK_DIR = "dark frames"
 FLAT_DIR = "flat-field frames"
@@ -57,7 +58,9 @@ def list_exposures(kdir):
             continue
         m = _EXPOSURE_RE.match(sub.name)
         if not m:
-            print(f"  ! skipping unrecognized folder: {sub}")
+            typer.secho(
+                f"  ! skipping unrecognized folder: {sub}", fg=typer.colors.YELLOW
+            )
             continue
         out.append((float(m.group(1)) / 1000.0, sub))
     out.sort(key=lambda x: x[0])
@@ -116,7 +119,7 @@ def load_exposure_stack(exp_dir, exp_s, r0, r1, c0, c1):
     """
     hdrs = iter_cubes(exp_dir)
     if not hdrs:
-        print(f"  ! no capture cubes in {exp_dir}")
+        typer.secho(f"  ! no capture cubes in {exp_dir}", fg=typer.colors.YELLOW)
         return None, None
 
     metas, n_bands = [], None
@@ -131,14 +134,18 @@ def load_exposure_stack(exp_dir, exp_s, r0, r1, c0, c1):
             except ValueError:
                 tint_ms = None
             if tint_ms is not None and abs(tint_ms - exp_s * 1000.0) > 1e-6:
-                print(
+                typer.secho(
                     f"  ! {h.stem}: hdr tint {tint_ms:g} ms != folder "
-                    f"{exp_s * 1000:g} ms"
+                    f"{exp_s * 1000:g} ms",
+                    fg=typer.colors.YELLOW,
                 )
         if n_bands is None:
             n_bands = int(img.shape[2])
         elif int(img.shape[2]) != n_bands:
-            print(f"  ! {h.stem}: {img.shape[2]} bands != {n_bands}, skipping cube")
+            typer.secho(
+                f"  ! {h.stem}: {img.shape[2]} bands != {n_bands}, skipping cube",
+                fg=typer.colors.YELLOW,
+            )
             continue
         metas.append((h, img))
     if not metas:
@@ -146,7 +153,10 @@ def load_exposure_stack(exp_dir, exp_s, r0, r1, c0, c1):
 
     wl = wavelengths_of(metas[0][1])
     if len(wl) != n_bands:
-        print(f"  ! wavelength list has {len(wl)} entries != {n_bands} bands")
+        typer.secho(
+            f"  ! wavelength list has {len(wl)} entries != {n_bands} bands",
+            fg=typer.colors.YELLOW,
+        )
         return None, None
 
     out = np.empty((len(metas), r1 - r0, c1 - c0, n_bands), dtype=np.uint16)
@@ -165,9 +175,10 @@ def load_exposure_stack(exp_dir, exp_s, r0, r1, c0, c1):
         if img.scale_factor != 1.0:
             cube = cube / float(img.scale_factor)  # mirrors read_subimage
         if int(cube.max()) > RAW_MAX_DN:
-            print(
+            typer.secho(
                 f"  ! cube {i}: max DN {int(cube.max())} > {RAW_MAX_DN} "
-                "(not 12-bit?) -- values may wrap on the <<4 shift"
+                "(not 12-bit?) -- values may wrap on the <<4 shift",
+                fg=typer.colors.YELLOW,
             )
         np.left_shift(cube, DN16_SHIFT, out=cube)  # in place; safe for <= 4095
         out[i] = cube

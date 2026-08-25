@@ -22,6 +22,7 @@ analyzed independently (see camchar/band_analyze.py).
 
 import math
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
@@ -29,9 +30,15 @@ import numpy as np
 import typer
 
 from .analyze import run as analyze_run
-from .analyze import SAT_CLIP_FRAC, SAT_MAX_DN
+from .analyze import SAT_MAX_DN
 from .backends import get_backend
-from .io_utils import camera_dir_name, save_sequence
+from .io_utils import (
+    DEFAULT_ROI_FRAC,
+    DEFAULT_ROI_SPECIM,
+    SAT_CLIP_FRAC,
+    camera_dir_name,
+    save_sequence,
+)
 
 # Exposures in milliseconds (converted to seconds only at the backend/
 # metadata boundary)
@@ -63,6 +70,14 @@ app = typer.Typer(
 )
 
 
+class Vendor(str, Enum):
+    """Registered camera backends (camchar/backends/)."""
+
+    playerone = "playerone"
+    basler = "basler"
+    thorlabs = "thorlabs"
+
+
 def _parse_exposures_ms(text):
     try:
         vals = [float(x) for x in text.split(",") if x.strip()]
@@ -78,9 +93,7 @@ def _ms_list(exposures_ms):
 
 
 def _vendor_option():
-    return typer.Option(
-        ..., help="camera vendor backend (playerone | basler | thorlabs)"
-    )
+    return typer.Option(..., help="camera vendor backend")
 
 
 def _run_sequence(vendor, out, exposures_ms, frames, gain, notes, seq_type):
@@ -467,7 +480,7 @@ def _check_saturation(vendor, exposures_ms, gain):
 
 @app.command()
 def get_dark_frames(
-    vendor: str = _vendor_option(),
+    vendor: Vendor = _vendor_option(),
     out: Path = typer.Option(
         "data",
         help="root output directory; frames go to "
@@ -488,12 +501,12 @@ def get_dark_frames(
     notes: str = typer.Option("dark", help="metadata notes, e.g. 'lens cap on'"),
 ):
     """Acquire dark frames (lens cap ON, dark room)."""
-    _run_sequence(vendor, out, exposures, frames, gain, notes, "dark")
+    _run_sequence(vendor.value, out, exposures, frames, gain, notes, "dark")
 
 
 @app.command()
 def get_flat_frames(
-    vendor: str = _vendor_option(),
+    vendor: Vendor = _vendor_option(),
     out: Path = typer.Option(
         "data",
         help="root output directory; frames go to "
@@ -514,7 +527,7 @@ def get_flat_frames(
     notes: str = typer.Option("flat", help="metadata notes, e.g. 'green LED ~530nm'"),
 ):
     """Acquire flat frames (uniform broadband illumination)."""
-    _run_sequence(vendor, out, exposures, frames, gain, notes, "flat")
+    _run_sequence(vendor.value, out, exposures, frames, gain, notes, "flat")
 
 
 @app.command()
@@ -526,8 +539,9 @@ def analyze(
     ),
     roi: Optional[str] = typer.Option(
         None,
-        help="ROI as r0:r1:c0:c1 (default 500:900:750:1150; SPECIM IQ "
-        "hyperspectral data defaults to a central 156:356:156:356)",
+        help="ROI as r0:r1:c0:c1 (default: central "
+        f"{DEFAULT_ROI_FRAC:.0%} of the recorded frame; SPECIM IQ "
+        f"hyperspectral data defaults to {':'.join(map(str, DEFAULT_ROI_SPECIM))})",
     ),
     bands: int = typer.Option(
         5,
@@ -545,16 +559,16 @@ def analyze(
 
 
 @app.command()
-def warmup_sensor(vendor: str = _vendor_option()):
+def warmup_sensor(vendor: Vendor = _vendor_option()):
     """Run the camera to warm it up to its steady-state operating temperature."""
-    rc = _warmup_sensor(vendor)
+    rc = _warmup_sensor(vendor.value)
     if rc:
         raise typer.Exit(rc)
 
 
 @app.command()
 def source_stability_check(
-    vendor: str = _vendor_option(),
+    vendor: Vendor = _vendor_option(),
     exposures: str = typer.Option(
         ",".join(map(str, SOURCE_STABILITY_EXPOSURES_MS)),
         parser=_parse_exposures_ms,
@@ -571,14 +585,14 @@ def source_stability_check(
     ),
 ):
     """Check the light-source stability for flat-field measurements."""
-    rc = _source_stability_check(vendor, exposures, frames, gain)
+    rc = _source_stability_check(vendor.value, exposures, frames, gain)
     if rc:
         raise typer.Exit(rc)
 
 
 @app.command()
 def check_saturation(
-    vendor: str = _vendor_option(),
+    vendor: Vendor = _vendor_option(),
     exposures: str = typer.Option(
         ",".join(map(str, DEFAULT_EXPOSURES_MS)),
         parser=_parse_exposures_ms,
@@ -604,7 +618,7 @@ def check_saturation(
         # the verdict logic (and the "last 3" target) assumes an ascending
         # sweep; silently sorting would hide the mistake from the user
         raise typer.BadParameter("--exposures must be strictly ascending")
-    rc = _check_saturation(vendor, exposures, gain)
+    rc = _check_saturation(vendor.value, exposures, gain)
     if rc:
         raise typer.Exit(rc)
 

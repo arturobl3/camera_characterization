@@ -319,11 +319,6 @@ class ThorlabsBackend(CameraBackend):
                 cam.dispose()
             except Exception:
                 pass
-        self._close_sdk_only(sdk)
-
-    def _close_sdk_only(self, sdk=None):
-        sdk = sdk if sdk is not None else self._sdk
-        self._sdk = None
         if sdk is not None:
             try:
                 sdk.dispose()

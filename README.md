@@ -92,9 +92,9 @@ EMVA-style saturation / absolute sensitivity threshold / dynamic range, and
 highpass-filtered PRNU1288/DSNU1288 (EMVA 1288 §8.1), and writes plots
 (dark mean + dark variance vs exposure, linearity, PTC, SNR; the SNR plot adds the
 EMVA Eq. 69 total-SNR curve and measured points including DSNU1288/PRNU1288) to
-`outputs/<vendor>_<model>_(<sensor>)/`. ROI defaults
-to a central 400×400 patch (500:900:750:1150); only the ROI needs uniform
-illumination.
+`outputs/<vendor>_<model>_(<sensor>)/`. ROI defaults to the central 50% of
+the recorded frame (even-sized window; `--roi r0:r1:c0:c1` overrides); only
+the ROI needs uniform illumination.
 The **EMVA 1288 Release 4 two-frame method is the primary estimator** (Eq. 18
 temporal variance with common-mode correction, Eq. 32 spatial covariance,
 averaged over consecutive pairs): adjacent-pair differences reject
@@ -144,20 +144,22 @@ uv run camchar analyze --data data/SPECIM_IQ --bands 7  # 7 curves per plot
   selected band (`--bands`, default 5, equispaced), plus a
   parameters-vs-wavelength summary figure (K, σr, dark current,
   PRNU/DSNU1288).
-- ROI defaults to the central 200×200 (156:356:156:356) of the 512×512
-  frame; `--roi` overrides.
+- ROI defaults to rows 140:290 / cols 156:306 of the 512×512 frame; `--roi`
+  overrides.
 
 ## Project layout
 
 ```
 camera_characterization/
 ├── camchar/
-│   ├── cli.py                 # argparse CLI (get-dark-frames | get-flat-frames | analyze)
+│   ├── cli.py                 # typer CLI (get-dark-frames | get-flat-frames | analyze | ...)
 │   ├── analyze.py             # temporal PTC analysis (K, σr, Nsat, PRNU, linearity)
 │   ├── band_analyze.py        # per-band EMVA analysis for hyperspectral data
+│   ├── cfa_analyze.py         # per-CFA-channel analysis for raw-Bayer datasets
 │   ├── specim.py              # SPECIM IQ ENVI discovery/loading (12-bit -> DN16)
 │   ├── plots.py               # matplotlib figures (Agg), monochrome + per-band
-│   ├── io_utils.py            # npy + metadata.json saving, stem_for() naming
+│   ├── report.py              # shared table/detail/CSV rendering for per-curve runs
+│   ├── io_utils.py            # npy + metadata.json saving, stem_for() naming, ROI constants
 │   └── backends/
 │       ├── base.py            # CameraBackend ABC
 │       ├── playerone.py       # Player One backend (pitfalls encoded)

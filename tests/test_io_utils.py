@@ -3,7 +3,7 @@
 import numpy as np
 
 from camchar import analyze as A
-from camchar.io_utils import camera_dir_name, save_sequence, stem_for
+from camchar.io_utils import camera_dir_name, central_roi, save_sequence, stem_for
 
 
 class TestStemFor:
@@ -71,3 +71,33 @@ class TestCameraDirName:
 
     def test_missing_vendor_model_never_raises(self):
         assert camera_dir_name({"sensor": "IMX174"}) == "_(IMX174)"
+
+
+class TestCentralRoi:
+    def test_imx174_frame(self):
+        assert central_roi(1920, 1200) == (300, 900, 480, 1440)
+
+    def test_square_ace2_frame(self):
+        assert central_roi(3536, 3536) == (884, 2652, 884, 2652)
+
+    def test_large_thorlabs_frame(self):
+        assert central_roi(4096, 3000) == (750, 2250, 1024, 3072)
+
+    def test_odd_dimensions_even_sides(self):
+        r = central_roi(1001, 601)
+        assert r == (150, 450, 250, 750)
+        assert (r[1] - r[0]) % 2 == 0
+        assert (r[3] - r[2]) % 2 == 0
+
+    def test_tiny_frame_clamped_to_min_side(self):
+        assert central_roi(4, 4) == (1, 3, 1, 3)
+        assert central_roi(2, 2) == (0, 2, 0, 2)
+
+    def test_custom_fraction(self):
+        assert central_roi(1000, 1000, 0.25) == (375, 625, 375, 625)
+
+    def test_window_inside_frame(self):
+        for w, h in ((1920, 1200), (3536, 3536), (4096, 3000), (7, 9), (2, 2)):
+            r0, r1, c0, c1 = central_roi(w, h)
+            assert 0 <= r0 < r1 <= h
+            assert 0 <= c0 < c1 <= w

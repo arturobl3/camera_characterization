@@ -119,7 +119,7 @@ def invoke(monkeypatch, args, backend):
 
 def test_stability_unstable(monkeypatch):
     r = invoke(
-        monkeypatch, ["source-stability-check", "--vendor", "fake"], UnstableBackend
+        monkeypatch, ["source-stability-check", "--vendor", "basler"], UnstableBackend
     )
     assert r.exit_code == 1
     assert "EXCEEDS THRESHOLD" in r.output
@@ -127,7 +127,7 @@ def test_stability_unstable(monkeypatch):
 
 def test_stability_stable(monkeypatch):
     r = invoke(
-        monkeypatch, ["source-stability-check", "--vendor", "fake"], StableBackend
+        monkeypatch, ["source-stability-check", "--vendor", "basler"], StableBackend
     )
     assert r.exit_code == 0
     assert "stable at all exposures" in r.output
@@ -138,24 +138,24 @@ def test_warmup_stable(monkeypatch):
     monkeypatch.setattr(cli, "WARMUP_STABLE_TOL_C", 0.3)
     monkeypatch.setattr(cli, "WARMUP_STOP_DELAY_S", 0.2)
     monkeypatch.setattr(cli, "WARMUP_PRINT_INTERVAL_S", 0.1)
-    r = invoke(monkeypatch, ["warmup-sensor", "--vendor", "fake"], StableBackend)
+    r = invoke(monkeypatch, ["warmup-sensor", "--vendor", "basler"], StableBackend)
     assert r.exit_code == 0
     assert "warmup complete" in r.output
 
 
 def test_warmup_interrupted(monkeypatch):
-    r = invoke(monkeypatch, ["warmup-sensor", "--vendor", "fake"], InterruptBackend)
+    r = invoke(monkeypatch, ["warmup-sensor", "--vendor", "basler"], InterruptBackend)
     assert r.exit_code == 130
 
 
 def test_warmup_aborted(monkeypatch):
     monkeypatch.setattr(cli, "WARMUP_MAX_CONSECUTIVE_FAILS", 2)
-    r = invoke(monkeypatch, ["warmup-sensor", "--vendor", "fake"], FailBackend)
+    r = invoke(monkeypatch, ["warmup-sensor", "--vendor", "basler"], FailBackend)
     assert r.exit_code == 1
 
 
 def test_warmup_no_temperature_backend(monkeypatch):
-    r = invoke(monkeypatch, ["warmup-sensor", "--vendor", "fake"], NoTempBackend)
+    r = invoke(monkeypatch, ["warmup-sensor", "--vendor", "basler"], NoTempBackend)
     assert r.exit_code == 1
     assert "no sensor temperature" in r.output
 
@@ -163,7 +163,7 @@ def test_warmup_no_temperature_backend(monkeypatch):
 def test_bad_exposures(monkeypatch):
     r = invoke(
         monkeypatch,
-        ["source-stability-check", "--vendor", "fake", "--exposures", "0.001,abc"],
+        ["source-stability-check", "--vendor", "basler", "--exposures", "0.001,abc"],
         StableBackend,
     )
     assert r.exit_code == 2
@@ -175,13 +175,25 @@ def test_missing_vendor(monkeypatch):
     assert "Missing option" in r.output
 
 
+def test_invalid_vendor(monkeypatch):
+    """Unknown vendor exits 2 at option validation, before any backend lookup."""
+
+    def _fail(name):  # must never be reached for an unregistered vendor name
+        raise AssertionError("get_backend called for invalid vendor")
+
+    monkeypatch.setattr(cli, "get_backend", _fail)
+    r = runner.invoke(cli.app, ["source-stability-check", "--vendor", "fake"])
+    assert r.exit_code == 2
+    assert "not one of" in r.output
+
+
 def test_saturation_ideal(monkeypatch):
     r = invoke(
         monkeypatch,
         [
             "check-saturation",
             "--vendor",
-            "fake",
+            "basler",
             "--exposures",
             "5,10,40,80,160",
         ],
@@ -197,7 +209,7 @@ def test_saturation_too_bright(monkeypatch):
         [
             "check-saturation",
             "--vendor",
-            "fake",
+            "basler",
             "--exposures",
             "10,20,40,80,160",
         ],
@@ -216,7 +228,7 @@ def test_saturation_too_dim(monkeypatch):
         [
             "check-saturation",
             "--vendor",
-            "fake",
+            "basler",
             "--exposures",
             "5,10,40,80,160",
         ],
@@ -230,7 +242,7 @@ def test_saturation_too_dim(monkeypatch):
 def test_saturation_no_signal(monkeypatch):
     r = invoke(
         monkeypatch,
-        ["check-saturation", "--vendor", "fake", "--exposures", "1,2,4"],
+        ["check-saturation", "--vendor", "basler", "--exposures", "1,2,4"],
         SatZeroSignalBackend,
     )
     assert r.exit_code == 1
@@ -240,7 +252,7 @@ def test_saturation_no_signal(monkeypatch):
 def test_saturation_descending_exposures_rejected(monkeypatch):
     r = invoke(
         monkeypatch,
-        ["check-saturation", "--vendor", "fake", "--exposures", "160,80,40"],
+        ["check-saturation", "--vendor", "basler", "--exposures", "160,80,40"],
         SatIdealBackend,
     )
     assert r.exit_code == 2

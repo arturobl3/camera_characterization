@@ -1,10 +1,40 @@
-"""Saving acquired stacks + metadata."""
+"""Saving acquired stacks + metadata, plus analysis constants shared by the
+CLI, the fits and the plots (kept here because every consumer already
+imports this module -- importing them from analyze.py would create cycles).
+
+DN convention: frames are 12-bit data stored as DN12 << 4 ("DN16").
+"""
 
 import json
 import time
 from pathlib import Path
 
 import numpy as np
+import typer
+
+DEFAULT_ROI_FRAC = 0.5  # default analysis ROI: central fraction of each dimension
+DEFAULT_ROI_SPECIM = (140, 290, 156, 306)  # SPECIM IQ ROI, see uniformity plot
+SAT_CLIP_FRAC = 0.002  # EMVA R4 Linear 6.6: saturation = <= 0.2% pixels at max
+
+
+def central_roi(width, height, frac=DEFAULT_ROI_FRAC):
+    """(r0, r1, c0, c1) covering the central ``frac`` of a width x height frame (pure).
+
+    The side length is rounded down to an even pixel count so the four Bayer
+    sub-lattices of a raw-Bayer dataset stay balanced, with a minimum of 2 px
+    per side; the window is centered on the frame ((n - size) // 2).
+    """
+
+    def span(n):
+        size = int(n * frac)
+        size -= size % 2
+        size = max(size, 2)
+        start = (n - size) // 2
+        return start, start + size
+
+    r0, r1 = span(height)
+    c0, c1 = span(width)
+    return (r0, r1, c0, c1)
 
 
 def stem_for(seq_type, exposure_s, gain):
@@ -85,7 +115,7 @@ def save_sequence(
     # quick quality report
     means = stack.mean(axis=(1, 2))
     stds = stack.std(axis=(1, 2))
-    print(
+    typer.echo(
         f"  saved {stem}.npy: {stack.shape}  frame mean {means.mean():.2f} "
         f"(±{means.std():.2f} across frames), spatial std {stds.mean():.2f}"
     )

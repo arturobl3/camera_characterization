@@ -10,18 +10,20 @@ import matplotlib.pyplot as plt
 import numpy as np
 import typer
 
-_DEFAULT_ROI = (500, 900, 750, 1150)
-_DEFAULT_ROI_SPECIM = (156, 356, 156, 356)
+from .io_utils import SAT_CLIP_FRAC
 
 
 def _title_with_camera(base, camera, roi):
+    """Append camera name and ROI tag to a plot title.
+
+    roi is the coordinates tuple (user-specified ROI), a ready-made label
+    such as 'central 50%' (fractional default), or None for no ROI tag.
+    """
     title = base
     if camera:
         title += "\n" + camera
-    if roi and tuple(roi) == _DEFAULT_ROI:
-        title += " (central 400x400 px ROI)"
-    elif roi and tuple(roi) == _DEFAULT_ROI_SPECIM:
-        title += " (central 200x200 px ROI)"
+    if isinstance(roi, str):
+        title += f" ({roi})"
     elif roi:
         title += f" (ROI rows {roi[0]}:{roi[1]}, cols {roi[2]}:{roi[3]})"
     return title
@@ -31,6 +33,22 @@ def _band_colors(n):
     """Distinct colors for per-band curves (default C-series palette)."""
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     return [colors[i % len(colors)] for i in range(max(n, 1))]
+
+
+def _r2(y, yhat):
+    """Centered R^2 of a fit (NaN when the total sum of squares is 0)."""
+    ss_res = float(np.sum((y - yhat) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    return 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+
+
+def _save_figure(fig, path):
+    """Save a figure into outputs/: mkdir parents, dpi=150 tight, close, report."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
 
 
 def _curve_label(r):
@@ -71,9 +89,7 @@ def save_dark_mean_plot(rows, out_dir, roi=None, camera=None):
         return None
     slope, intercept = np.polyfit(x, y, 1)
     yhat = np.polyval([slope, intercept], x)
-    ss_res = float(np.sum((y - yhat) ** 2))
-    ss_tot = float(np.sum((y - y.mean()) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    r2 = _r2(y, yhat)
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.semilogx(x, y, "o", ms=5, label="dark (measured)")
@@ -111,12 +127,9 @@ def save_dark_mean_plot(rows, out_dir, roi=None, camera=None):
     )
 
     out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
     path = out_path / "dark_mean_vs_exposure.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
-    return {"slope": slope, "intercept": intercept, "r2": r2}
+    _save_figure(fig, path)
+    return None
 
 
 def save_dark_variance_plot(rows, out_dir, roi=None, camera=None, dsnu=None):
@@ -141,9 +154,7 @@ def save_dark_variance_plot(rows, out_dir, roi=None, camera=None, dsnu=None):
     slope, offset = np.polyfit(x, y, 1)
     slope_nf, offset_nf = np.polyfit(x, y_nf, 1)
     yhat = np.polyval([slope, offset], x)
-    ss_res = float(np.sum((y - yhat) ** 2))
-    ss_tot = float(np.sum((y - y.mean()) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    r2 = _r2(y, yhat)
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(x, y, "o", ms=5, label=r"$\sigma_y^2$ (two-frame, Eq. 18)")
@@ -195,13 +206,9 @@ def save_dark_variance_plot(rows, out_dir, roi=None, camera=None, dsnu=None):
         bbox=dict(boxstyle="round", fc="white", alpha=0.85),
     )
 
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / "dark_variance_vs_exposure.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
-    return {"slope": slope, "offset": offset, "r2": r2}
+    path = Path(out_dir) / "dark_variance_vs_exposure.png"
+    _save_figure(fig, path)
+    return None
 
 
 def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
@@ -213,8 +220,6 @@ def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
     while carrying no real signal. Saturated points are drawn but excluded.
     Saves linearity_mean_vs_exposure.png.
     """
-    from .analyze import SAT_CLIP_FRAC  # local: avoid import cycle
-
     x = np.array([e for e, _ in rows]) * 1000
     y = np.array([s["mean"] for _, s in rows])
     sat = np.array([s["sat_frac"] for _, s in rows])
@@ -228,9 +233,7 @@ def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
     xf, yf = x[fit_mask], y[fit_mask] - bias_dn
     slope, intercept = np.polyfit(xf, yf, 1)
     yhat = np.polyval([slope, intercept], xf)
-    ss_res = float(np.sum((yf - yhat) ** 2))
-    ss_tot = float(np.sum((yf - yf.mean()) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    r2 = _r2(yf, yhat)
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(xf, yf, "o", ms=5, label="flat (unclipped)")
@@ -267,13 +270,9 @@ def save_linearity_plot(rows, bias_dn, out_dir, clip_dn, roi=None, camera=None):
         bbox=dict(boxstyle="round", fc="white", alpha=0.85),
     )
 
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / "linearity_mean_vs_exposure.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
-    return {"slope": slope, "intercept": intercept, "r2": r2}
+    path = Path(out_dir) / "linearity_mean_vs_exposure.png"
+    _save_figure(fig, path)
+    return None
 
 
 def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
@@ -368,12 +367,8 @@ def save_ptc_plot(flat, dark, out_dir, clip_dn, roi=None, camera=None):
         bbox=dict(boxstyle="round", fc="white", alpha=0.85),
     )
 
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / "ptc_variance_vs_mean.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    path = Path(out_dir) / "ptc_variance_vs_mean.png"
+    _save_figure(fig, path)
     return None
 
 
@@ -487,12 +482,8 @@ def save_snr_plot(flat, out_dir, clip_dn, roi=None, camera=None):
         bbox=dict(boxstyle="round", fc="white", alpha=0.85),
     )
 
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / "snr_vs_signal.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    path = Path(out_dir) / "snr_vs_signal.png"
+    _save_figure(fig, path)
     return None
 
 
@@ -524,9 +515,7 @@ def save_dark_plot_bands(sel_results, out_dir, roi=None, camera=None):
         y = np.array([s["mean"] for _, s in rows])
         slope, intercept = np.polyfit(x, y, 1)
         yhat = slope * x + intercept
-        ss_res = float(np.sum((y - yhat) ** 2))
-        ss_tot = float(np.sum((y - y.mean()) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        r2 = _r2(y, yhat)
         xl = np.linspace(x.min(), x.max(), 100)
         ax.semilogx(
             x,
@@ -571,12 +560,8 @@ def save_dark_plot_bands(sel_results, out_dir, roi=None, camera=None):
     )
     ax.legend(fontsize=8, loc="lower right")
     ax.grid(alpha=0.3, which="both")
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / "dark_mean_vs_exposure_bands.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    path = Path(out_dir) / "dark_mean_vs_exposure_bands.png"
+    _save_figure(fig, path)
     return None
 
 
@@ -623,9 +608,7 @@ def save_dark_variance_plot_bands(sel_results, out_dir, roi=None, camera=None):
             color=color,
         )
         yhat = slope * x + offset
-        ss_res = float(np.sum((y - yhat) ** 2))
-        ss_tot = float(np.sum((y - y.mean()) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        r2 = _r2(y, yhat)
         r2_txt = rf"$R^2 = {r2:.4f}$" if np.isfinite(r2) else r"$R^2 = \text{--}$"
         extras = r.get("extras")
         dsnu = extras["dsnu1288_dn"] if extras else None
@@ -669,12 +652,8 @@ def save_dark_variance_plot_bands(sel_results, out_dir, roi=None, camera=None):
     )
     ax.legend(fontsize=9)
     ax.grid(alpha=0.3)
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / "dark_variance_vs_exposure_bands.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    path = Path(out_dir) / "dark_variance_vs_exposure_bands.png"
+    _save_figure(fig, path)
     return None
 
 
@@ -690,8 +669,6 @@ def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=No
     unclipped points) and the (centered) R^2. Saves
     linearity_mean_vs_exposure_bands.png.
     """
-    from .analyze import SAT_CLIP_FRAC  # local: avoid import cycle
-
     fig, ax = plt.subplots(figsize=(8, 5))
     drew = False
     for color, r in zip(_result_colors(sel_results), sel_results):
@@ -718,9 +695,7 @@ def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=No
             ax.plot(x[~m], y[~m], "x", ms=7, color=color, alpha=0.7)
         a, b = np.polyfit(x[m], y[m], 1)  # mu = a*t + b on unclipped points
         y_hat = a * x[m] + b
-        ss_res = float(np.sum((y[m] - y_hat) ** 2))
-        ss_tot = float(np.sum((y[m] - y[m].mean()) ** 2))
-        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        r2 = _r2(y[m], y_hat)
         xl = np.linspace(x[m].min(), x[m].max(), 100)
         r2_txt = rf"$R^2={r2:.4f}$" if np.isfinite(r2) else ""
         ax.plot(
@@ -754,12 +729,8 @@ def save_linearity_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=No
     )
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / "linearity_mean_vs_exposure_bands.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    path = Path(out_dir) / "linearity_mean_vs_exposure_bands.png"
+    _save_figure(fig, path)
     return None
 
 
@@ -892,12 +863,8 @@ def save_ptc_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
     )
     ax.grid(alpha=0.3)
     ax.grid(which="minor", ls="--", alpha=0.3)
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / "ptc_variance_vs_mean_bands.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    path = Path(out_dir) / "ptc_variance_vs_mean_bands.png"
+    _save_figure(fig, path)
     return None
 
 
@@ -1030,12 +997,8 @@ def save_snr_plot_bands(sel_results, out_dir, clip_dn, roi=None, camera=None):
         fontsize=8.5,
         bbox=dict(boxstyle="round", fc="white", alpha=0.85),
     )
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / "snr_vs_signal_bands.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    path = Path(out_dir) / "snr_vs_signal_bands.png"
+    _save_figure(fig, path)
     return None
 
 
@@ -1066,7 +1029,7 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
         """Restrict a value array to the 500-800 nm mask (NaN outside)."""
         return np.where(mask, np.asarray(a, dtype=float), np.nan)
 
-    def _mean_of(a, fmt):
+    def _mean_of(a):
         ok = np.isfinite(a)
         n = int(ok.sum())
         m = float(np.nanmean(a)) if n else float("nan")
@@ -1108,8 +1071,8 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
     ax.plot(wl, knf, ".", ms=3, alpha=0.6, label="K (N-frame)")
     ax.set_ylabel(r"$K$ (e⁻/DN12)")
     ax.set_title("System gain $K$")
-    m, n = _mean_of(k, ".1f")
-    m_mid, n_mid = _mean_of(_sub(k, mid), ".1f")
+    m, n = _mean_of(k)
+    m_mid, n_mid = _mean_of(_sub(k, mid))
     _mean_lines(ax, m, m_mid)
     _mean_box(
         ax,
@@ -1127,8 +1090,8 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
     ax.plot(wl, snr_max, "o", ms=3, label="SNR_max")
     ax.set_ylabel(r"$\mathrm{SNR}_{\max}$")
     ax.set_title(r"Peak SNR (Eq. 55: $\sqrt{\mu_{e,\mathrm{sat}}}$)")
-    m, n = _mean_of(snr_max, ".1f")
-    m_mid, n_mid = _mean_of(_sub(snr_max, mid), ".1f")
+    m, n = _mean_of(snr_max)
+    m_mid, n_mid = _mean_of(_sub(snr_max, mid))
     _mean_lines(ax, m, m_mid)
     _mean_box(
         ax,
@@ -1146,8 +1109,8 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
     ax.set_ylabel(r"$I_d$ (DN16/s)")
     ax.set_xlabel("wavelength (nm)")
     ax.set_title("Dark current (Eq. 29 mean fit)")
-    m, n = _mean_of(np.where(pos, dc, np.nan), ".2f")
-    m_mid, n_mid = _mean_of(np.where(pos & mid, dc, np.nan), ".2f")
+    m, n = _mean_of(np.where(pos, dc, np.nan))
+    m_mid, n_mid = _mean_of(np.where(pos & mid, dc, np.nan))
     _mean_lines(ax, m, m_mid)
     _mean_box(
         ax,
@@ -1183,10 +1146,10 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
         label="DSNU1288 (DN16) 500-800 nm",
     )
     ax2.set_ylabel("DSNU1288 (DN16)", color="tab:red")
-    m_prnu, n = _mean_of(prnu, ".2f")
-    m_dsnu, _ = _mean_of(dsnu, ".2f")
-    m_prnu_mid, n_mid = _mean_of(_sub(prnu, mid), ".2f")
-    m_dsnu_mid, _ = _mean_of(_sub(dsnu, mid), ".2f")
+    m_prnu, n = _mean_of(prnu)
+    m_dsnu, _ = _mean_of(dsnu)
+    m_prnu_mid, n_mid = _mean_of(_sub(prnu, mid))
+    m_dsnu_mid, _ = _mean_of(_sub(dsnu, mid))
     _mean_lines(ax, m_prnu, m_prnu_mid)
     _mean_lines(ax2, m_dsnu, m_dsnu_mid)
     _mean_box(
@@ -1203,17 +1166,12 @@ def save_band_parameters_plot(results, selected, out_dir, camera=None):
     if camera:
         fig.suptitle(f"{camera} -- per-band EMVA 1288 R4 (Linear) parameters")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / "band_parameters_vs_wavelength.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    _save_figure(fig, Path(out_dir) / "band_parameters_vs_wavelength.png")
     return None
 
 
 def save_flat_uniformity_plot(
-    imgs, wl_sel, exp_ms, n_cubes, out_dir, roi=None, camera=None
+    imgs, wl_sel, exp_s, n_cubes, out_dir, roi=None, camera=None
 ):
     """3x3 grid of the shortest flat exposure's bands with the ROI overlaid.
 
@@ -1222,7 +1180,7 @@ def save_flat_uniformity_plot(
     1-99 percentile range (per-band contrast, so dark-edge and bright bands
     are both readable); the dashed red rectangle is the analysis ROI, drawn
     on pixel edges so it aligns with imshow. Saves
-    flat_uniformity_{exp_ms:g}ms.png.
+    flat_uniformity_{exp_s:g}ms.png.
     """
     from matplotlib.patches import Rectangle  # local: matches Line2D pattern
 
@@ -1256,19 +1214,14 @@ def save_flat_uniformity_plot(
         ax.set_yticks([])
     fig.suptitle(
         _title_with_camera(
-            f"Flat-field uniformity ({exp_ms * 1000:g} ms, avg of {n_cubes} cubes)",
+            f"Flat-field uniformity ({exp_s * 1000:g} ms, avg of {n_cubes} cubes)",
             camera,
             roi,
         ),
         fontsize=11,
     )
     fig.tight_layout(rect=(0, 0, 1, 0.95))
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / f"flat_uniformity_{exp_ms * 1000:g}ms.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    _save_figure(fig, Path(out_dir) / f"flat_uniformity_{exp_s * 1000:g}ms.png")
     return None
 
 
@@ -1300,9 +1253,10 @@ def save_band_mean_roi_plot(stats, wl, out_dir, kind, clip_dn, roi=None, camera=
         ax = axes[i // n_cols][i % n_cols]
         y = np.array([s["mean"] for s in stats[e]])
         if len(y) != len(wl):
-            print(
+            typer.secho(
                 f"  ! [{kind}] {e * 1000:g} ms: {len(y)} bands != {len(wl)} "
-                "wavelengths, skipping subplot"
+                "wavelengths, skipping subplot",
+                fg=typer.colors.YELLOW,
             )
             continue
         sat = y >= clip_dn
@@ -1329,10 +1283,5 @@ def save_band_mean_roi_plot(stats, wl, out_dir, kind, clip_dn, roi=None, camera=
     fig.supxlabel("wavelength (nm)")
     fig.supylabel(r"$\mu_y$ (DN16)")
     fig.tight_layout(rect=(0, 0, 1, 0.95))
-    out_path = Path(out_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-    path = out_path / f"band_mean_roi_{kind}.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    typer.secho(f"  [plot] saved {path}", fg=typer.colors.GREEN)
+    _save_figure(fig, Path(out_dir) / f"band_mean_roi_{kind}.png")
     return None

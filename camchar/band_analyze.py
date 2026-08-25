@@ -17,8 +17,10 @@ import csv
 from pathlib import Path
 
 import numpy as np
+import typer
 
 from . import analyze
+from . import report
 from . import specim
 from .analyze import (
     CLIP_DN,
@@ -98,10 +100,13 @@ def _load_kind_stats(exps, kind, r0, r1, c0, c1):
         if wavelengths is None:
             wavelengths = wl
         elif len(wl) != len(wavelengths):
-            print(f"  ! [{kind}] {exp_s * 1000:g} ms: band count changed, skipping")
+            typer.secho(
+                f"  ! [{kind}] {exp_s * 1000:g} ms: band count changed, skipping",
+                fg=typer.colors.YELLOW,
+            )
             continue
         n, _, _, n_bands = stack.shape
-        print(
+        typer.echo(
             f"  [{kind}] {exp_s * 1000:7.1f} ms: {n} cubes x {n_bands} bands "
             f"(DN16, ROI-cropped)"
         )
@@ -137,9 +142,7 @@ def _load_shortest_flat_frames(flat_exps, sel_bands):
 def _extras_for_band(b, dark, flat, dk, flat_fit):
     """emva_extras_core inputs picked per band (mirrors emva1288_extras)."""
     rows = flat_fit["rows"]
-    ok = [rs for rs in rows if rs[1]["sat_frac"] <= analyze.SAT_CLIP_FRAC]
-    if not ok:
-        ok = [rs for rs in rows if rs[1]["mean"] < CLIP_DN]
+    ok, _ = analyze.usable_flat_points(rows)
     if not ok:
         return None
     mu_sat = max(s["mean"] for _, s in ok)
@@ -207,119 +210,27 @@ def _select_bands(n_bands, n_sel):
 
 
 def _print_table(results):
-    print("\n=== PER-BAND PARAMETERS (K/sigma_r in e-; DN = DN16) ===")
-    print(
-        f"{'band':>4} {'lambda':>7} {'K12':>6} {'K12nf':>6} {'sig_r':>6} "
-        f"{'sr_q':>6} {'d.cur':>8} {'DSNU':>6} {'PRNU':>6} {'Nsat':>7} "
-        f"{'DR':>6}  status"
+    report.print_param_table(
+        results,
+        "\n=== PER-BAND PARAMETERS (K/sigma_r in e-; DN = DN16) ===",
+        f"{'band':>4} {'lambda':>7} ",
+        lambda r: f"{r['band']:4d} {r['wl_nm']:7.1f} ",
     )
-    for r in results:
-        f, x, dk = r["flat"], r["extras"], r["dark"]
-        if not f:
-            print(
-                f"{r['band']:4d} {r['wl_nm']:7.1f}  {'-':>6} {'-':>6} {'-':>6} "
-                f"{'-':>6} {'-':>8} {'-':>6} {'-':>6} {'-':>7} {'-':>6}  "
-                f"{r['status']}"
-            )
-            continue
-        ok = (
-            np.isfinite(f["K12"]) and f["K12"] > 0
-        )  # degenerate fits report '-' for K-derived columns
-        ok_nf = np.isfinite(f["K12_nf"]) and f["K12_nf"] > 0
-        tail = (
-            "      -      -      -      -"
-            if x is None or not ok
-            else (
-                f" {x['dsnu1288_dn']:6.2f} {x['prnu1288_pct']:6.2f} "
-                f"{x['nsat_e']:7.0f} {x['dr']:6.0f}"
-            )
-        )
-        print(
-            f"{r['band']:4d} {r['wl_nm']:7.1f} "
-            + (f"{f['K12']:6.2f} " if ok else f"{'-':>6} ")
-            + (f"{f['K12_nf']:6.2f} " if ok_nf else f"{'-':>6} ")
-            + (
-                f"{f['sigma_r_e']:6.2f} {f['sigma_r_e_q']:6.2f} "
-                if ok
-                else f"{'-':>6} {'-':>6} "
-            )
-            + f"{dk['dark_current_dn_per_s']:8.2f}"
-            + tail
-            + f"  {r['status']}"
-        )
 
 
 def _print_band_detail(r):
-    dk, f, x = r["dark"], r["flat"], r["extras"]
-    print(f"\n-- band {r['band']} ({r['wl_nm']:.2f} nm) --")
-    print(
-        f"  bias {dk['bias_dn']:.2f} DN16; dark current "
-        f"{dk['dark_current_dn_per_s']:.4f} DN16/s "
-        f"(var {dk['dark_current_var_dn2_per_s']:.2f} DN16^2/s; "
-        f"nf {dk['dark_current_var_dn2_per_s_nf']:.2f})"
+    report.print_curve_detail(
+        r["dark"],
+        r["flat"],
+        r["extras"],
+        r["status"],
+        f"\n-- band {r['band']} ({r['wl_nm']:.2f} nm) --",
+        quick_prnu=True,
+        degen_cause=True,
     )
-    print(
-        f"  sigma_r (Eq. 30) {dk['sigma_r_dn']:.2f} DN16 "
-        f"(short-exposure median {dk['sigma_r_median_dn']:.2f})"
-    )
-    if not f:
-        return
-    if "degenerate" in r["status"]:
-        print(
-            f"  ! degenerate PTC fit (two-frame slope {f['ptc_slope']:.3f} <= 0): "
-            f"even the adjacent-pair variance is bent (saturation collapse "
-            f"and/or per-acquisition shutter/lamp jumps) -- check the data"
-        )
-    print(
-        f"  K (two-frame) = {f['K12']:.2f} e-/DN12 (N-frame {f['K12_nf']:.2f}, "
-        f"{100 * (f['K12_nf'] - f['K12']) / f['K12']:+.1f}%); "
-        f"PTC R2 = {f['ptc_r2']:.6f}"
-    )
-    print(
-        f"  sigma_r = {f['sigma_r_e']:.2f} e- (nf {f['sigma_r_nf_e']:.2f}; "
-        f"Eq. 53 quant-corrected {f['sigma_r_e_q']:.2f} e-)"
-    )
-    print(f"  Nsat (PTC, 4094 clip) = {f['Nsat']:.0f} e-")
-    if f["prnu_pct"] is not None:
-        print(f"  PRNU quick upper bound = {f['prnu_pct']:.2f} %")
-    if x:
-        print(
-            f"  mu_y.sat = {x['mu_sat_dn']:.0f} DN16; Nsat (EMVA) = "
-            f"{x['nsat_e']:.0f} e-; DR = {x['dr']:.0f} ({x['dr_db']:.1f} dB)"
-        )
-        print(
-            f"  PRNU1288 = {x['prnu1288_pct']:.2f} %; "
-            f"DSNU1288 = {x['dsnu1288_dn']:.2f} DN16"
-        )
 
 
-_CSV_COLUMNS = [
-    "band",
-    "wavelength_nm",
-    "status",
-    "K12_e_per_DN12",
-    "K12_nf_e_per_DN12",
-    "ptc_r2",
-    "sigma_r_e",
-    "sigma_r_e_q",
-    "sigma_r_nf_e",
-    "sigma_r_nf_e_q",
-    "bias_dn16",
-    "sigma_r_dn16",
-    "sigma_r_median_dn16",
-    "dark_current_dn16_per_s",
-    "dark_current_var_dn16_2_per_s",
-    "dark_current_var_dn16_2_per_s_nf",
-    "prnu_quick_pct",
-    "mu_sat_dn16",
-    "nsat_emva_e",
-    "nsat_ptc_e",
-    "mu_min_e",
-    "dynamic_range",
-    "dynamic_range_db",
-    "prnu1288_pct",
-    "dsnu1288_dn16",
-]
+_CSV_COLUMNS = ["band", "wavelength_nm", "status", *report.PARAM_COLUMNS]
 
 
 def _write_csv(results, path):
@@ -329,64 +240,35 @@ def _write_csv(results, path):
         w = csv.writer(fh)
         w.writerow(_CSV_COLUMNS)
         for r in results:
-            f, x, dk = r["flat"], r["extras"], r["dark"]
             row = {
                 "band": r["band"],
                 "wavelength_nm": f"{r['wl_nm']:.2f}",
                 "status": r["status"],
-                "bias_dn16": f"{dk['bias_dn']:.2f}",
-                "sigma_r_dn16": f"{dk['sigma_r_dn']:.3f}",
-                "sigma_r_median_dn16": f"{dk['sigma_r_median_dn']:.3f}",
-                "dark_current_dn16_per_s": f"{dk['dark_current_dn_per_s']:.4f}",
-                "dark_current_var_dn16_2_per_s": f"{dk['dark_current_var_dn2_per_s']:.3f}",
-                "dark_current_var_dn16_2_per_s_nf": (
-                    f"{dk['dark_current_var_dn2_per_s_nf']:.3f}"
-                ),
             }
-            if f:
-                row.update(
-                    {
-                        "K12_e_per_DN12": f"{f['K12']:.4f}",
-                        "K12_nf_e_per_DN12": f"{f['K12_nf']:.4f}",
-                        "ptc_r2": f"{f['ptc_r2']:.6f}",
-                        "sigma_r_e": f"{f['sigma_r_e']:.4f}",
-                        "sigma_r_e_q": f"{f['sigma_r_e_q']:.4f}",
-                        "sigma_r_nf_e": f"{f['sigma_r_nf_e']:.4f}",
-                        "sigma_r_nf_e_q": f"{f['sigma_r_nf_e_q']:.4f}",
-                        "nsat_ptc_e": f"{f['Nsat']:.1f}",
-                        "prnu_quick_pct": (
-                            f"{f['prnu_pct']:.3f}" if f["prnu_pct"] is not None else ""
-                        ),
-                    }
-                )
-            if x:
-                row.update(
-                    {
-                        "mu_sat_dn16": f"{x['mu_sat_dn']:.1f}",
-                        "nsat_emva_e": f"{x['nsat_e']:.1f}",
-                        "mu_min_e": f"{x['mu_min_e']:.3f}",
-                        "dynamic_range": f"{x['dr']:.1f}",
-                        "dynamic_range_db": f"{x['dr_db']:.2f}",
-                        "prnu1288_pct": f"{x['prnu1288_pct']:.3f}",
-                        "dsnu1288_dn16": f"{x['dsnu1288_dn']:.3f}",
-                    }
-                )
+            if r["dark"]:
+                row.update(report.csv_dark_cells(r["dark"]))
+            row.update(report.csv_flat_cells(r.get("flat")))
+            row.update(report.csv_extras_cells(r.get("extras")))
             w.writerow([row.get(c, "") for c in _CSV_COLUMNS])
-    print(f"  [csv] saved {path}")
+    typer.secho(f"  [csv] saved {path}", fg=typer.colors.GREEN)
 
 
 def run(cam_dir, roi, n_plot_bands=5):
     r0, r1, c0, c1 = roi
-    print(
-        f"Analyzing {cam_dir.resolve()}  (per-band; ROI rows {r0}:{r1}, cols {c0}:{c1})"
+    typer.secho(
+        f"Analyzing {cam_dir.resolve()}  (per-band; ROI rows {r0}:{r1}, cols {c0}:{c1})",
+        bold=True,
+        fg=typer.colors.CYAN,
     )
 
     dark_exps = specim.list_exposures(specim.kind_dir(cam_dir, "dark"))
     if not dark_exps:
-        print("  ! no dark frames found -- nothing to analyze")
+        typer.secho(
+            "  ! no dark frames found -- nothing to analyze", fg=typer.colors.YELLOW
+        )
         return
     flat_exps = specim.list_exposures(specim.kind_dir(cam_dir, "flat"))
-    print(
+    typer.echo(
         f"  dark: {len(dark_exps)} exposures ("
         + ", ".join(f"{e * 1000:g}" for e, _ in dark_exps)
         + " ms); flat: "
@@ -401,53 +283,41 @@ def run(cam_dir, roi, n_plot_bands=5):
 
     dark = _load_kind_stats(dark_exps, "dark", r0, r1, c0, c1)
     if not dark["stats"]:
-        print("  ! no dark cubes loaded -- nothing to analyze")
+        typer.secho(
+            "  ! no dark cubes loaded -- nothing to analyze", fg=typer.colors.YELLOW
+        )
         return
     flat = _load_kind_stats(flat_exps, "flat", r0, r1, c0, c1)
     wl = dark["wl"]
     n_bands = len(wl)
-    print(
+    typer.echo(
         f"\n  {n_bands} bands, {wl[0]:.1f}-{wl[-1]:.1f} nm; "
         f"analyzing each band as an independent camera"
     )
 
     results = [_analyze_band(b, float(wl[b]), dark, flat) for b in range(n_bands)]
     _print_table(results)
-
-    gaps = [
-        abs(r["flat"]["K12_nf"] - r["flat"]["K12"]) / r["flat"]["K12"]
-        for r in results
-        if r["flat"]
-        and np.isfinite(r["flat"]["K12"])
-        and r["flat"]["K12"] > 0
-        and np.isfinite(r["flat"]["K12_nf"])
-        and r["flat"]["K12_nf"] > 0
-    ]
-    n_degen = sum(1 for r in results if "degenerate" in r["status"])
-    if n_degen:
-        print(
-            f"  ! {n_degen} bands with non-positive two-frame PTC slope "
-            f"(saturation-collapsed variance) -- check the data"
-        )
-    if gaps:
-        med = float(np.median(gaps))
-        flag = "  ! " if med > 0.01 else "  "
-        print(
-            f"{flag}N-frame vs two-frame K: median |K_nf-K|/K = {med * 100:.2f}% "
-            f"({'>1% -- drift between acquisitions' if med > 0.01 else 'ok'})"
-        )
+    report.check_drift_and_degenerate(results, "bands")
 
     selected = _select_bands(n_bands, n_plot_bands)
-    print(f"\n=== EMVA DETAIL (plotted bands: {selected}) ===")
+    typer.secho(
+        f"\n=== EMVA DETAIL (plotted bands: {selected}) ===",
+        bold=True,
+        fg=typer.colors.CYAN,
+    )
     for r in results:
         if r["band"] in selected:
             _print_band_detail(r)
 
     out_dir = Path("outputs") / cam_dir.name
     _write_csv(results, out_dir / "band_parameters.csv")
-    save_band_mean_roi_plot(dark["stats"], wl, out_dir, "dark", CLIP_DN, roi, _CAMERA_LABEL)
+    save_band_mean_roi_plot(
+        dark["stats"], wl, out_dir, "dark", CLIP_DN, roi, _CAMERA_LABEL
+    )
     if flat["stats"]:
-        save_band_mean_roi_plot(flat["stats"], wl, out_dir, "flat", CLIP_DN, roi, _CAMERA_LABEL)
+        save_band_mean_roi_plot(
+            flat["stats"], wl, out_dir, "flat", CLIP_DN, roi, _CAMERA_LABEL
+        )
     if flat_exps:
         sel9 = _select_bands(n_bands, 9)
         f_imgs, wl_sel, exp_s, n_cubes = _load_shortest_flat_frames(flat_exps, sel9)
