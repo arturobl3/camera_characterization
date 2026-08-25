@@ -251,6 +251,12 @@ software needs to run. Verified on the Kiralux LP126MU:
 - hot-pixel correction is disabled by `configure()` (it substitutes neighbor
   values and would corrupt variance statistics).
 
+Color models (tested: LP126CU) work through the same path: the SDK delivers
+**raw right-aligned Bayer** (no demosaicing — its color processor is opt-in
+and unused), `metadata.json` records `pixel_format` (e.g. `"BayerBG12"` for
+the LP126CU, whose origin pixel is blue), and `analyze` automatically pools
+the CFA sub-lattices for DSNU/PRNU like on Basler color models.
+
 Full SDK distribution (docs, installers, examples) lives untracked under
 `Scientific Camera Interfaces/`.
 

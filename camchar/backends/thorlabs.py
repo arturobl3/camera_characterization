@@ -36,8 +36,17 @@ Pitfalls this backend encodes (all verified empirically on the hardware):
   8. Hot-pixel correction substitutes neighbor values into flagged pixels,
      which destroys temporal-variance statistics; configure() turns it off
      when the camera supports it.
-  9. Black level is left at the factory default (5 DN12 on the LP126MU,
+  9. Black level is left at the factory default (5 DN12 on the LP126MU/LP126CU,
      dark mean sits safely above zero) and recorded as black_level_dn12.
+ 10. Color models deliver raw right-aligned Bayer at bit_depth -- the SDK
+     never demosaics unless asked (the color processor is opt-in and unused).
+     open() records pixel_format from camera_sensor_type +
+     color_filter_array_phase ('BayerBG12' on the LP126CU, whose origin
+     pixel is blue) so analyze.py engages its CFA-aware spatial metrics;
+     mono models record 'Mono12' explicitly.
+ 11. Discovery and open_camera() are re-run together on every retry attempt:
+     the serial can vanish between the two calls ("Serial number not found"
+     was observed on a freshly connected LP126CU).
 """
 
 import os
@@ -64,7 +73,7 @@ if sys.platform == "win32" and os.path.isdir(_LIB_DIR):
         pass
 
 from thorlabs_tsi_sdk.tl_camera import TLCameraSDK  # noqa: E402
-from thorlabs_tsi_sdk.tl_camera_enums import OPERATION_MODE  # noqa: E402
+from thorlabs_tsi_sdk.tl_camera_enums import OPERATION_MODE, SENSOR_TYPE  # noqa: E402
 
 _POLL_TIMEOUT_MS = 1000  # per-poll block; snap() enforces its own deadline
 _GRAB_TIMEOUT_MARGIN_S = 10.0  # same spirit as basler's +5000 ms margin
@@ -72,6 +81,34 @@ _GRAB_TIMEOUT_MARGIN_S = 10.0  # same spirit as basler's +5000 ms margin
 # model -> sensor name; the TLCamera API exposes no sensor-model string,
 # so entries go here only once confirmed (LP126MU dir name stays clean).
 _KNOWN_MODELS = {}
+
+_BAYER_SENSOR_TYPE = int(SENSOR_TYPE.BAYER)
+
+# FILTER_ARRAY_PHASE value -> Bayer layout letters, origin pixel first.
+# The LP126CU reports BAYER_BLUE (origin blue) -> BGGR.
+_CFA_LETTERS = {
+    0: "RG",  # BAYER_RED
+    1: "BG",  # BAYER_BLUE
+    2: "GR",  # GREEN_LEFT_OF_RED
+    3: "GB",  # GREEN_LEFT_OF_BLUE
+}
+
+
+def _pixel_format(sensor_type, cfa_phase, bit_depth):
+    """Dataset format string from the TLCamera enums (pure).
+
+    Mono models get 'Mono<bit_depth>'; color models get
+    'Bayer<layout><bit_depth>' -- e.g. the LP126CU (phase BAYER_BLUE) maps to
+    'BayerBG12'. analyze.py detects raw-Bayer datasets via this string and
+    derives the CFA phase labels from its layout letters.
+    """
+    if int(sensor_type) != _BAYER_SENSOR_TYPE:
+        return f"Mono{int(bit_depth)}"
+    letters = _CFA_LETTERS.get(cfa_phase)
+    if letters is None:
+        # layout unknown; analyze's labels fall back to RGGB
+        return f"Bayer{int(bit_depth)}"
+    return f"Bayer{letters}{int(bit_depth)}"
 
 
 @register("thorlabs")
@@ -97,18 +134,35 @@ class ThorlabsBackend(CameraBackend):
                 f"package) and {_LIB_DIR} (native libraries)"
             )
         t0 = time.time()
-        serials = []
+        cam = None
+        serial = None
         last_err = None
         while time.time() - t0 < self._retry:
             try:
                 if self._sdk is None:
                     self._sdk = TLCameraSDK()
+                # Discover and open within one attempt: the device can
+                # re-enumerate between the two calls ("Serial number not
+                # found" was observed on a freshly connected LP126CU), so
+                # every retry re-discovers before opening.
                 serials = self._sdk.discover_available_cameras()
-                if serials:
-                    break
-                last_err = RuntimeError("no cameras discovered yet")
-            except Exception as exc:  # half-dead device / dll hiccup
+                if not serials:
+                    last_err = RuntimeError("no cameras discovered yet")
+                    serial = None
+                else:
+                    serial = self._serial or serials[0]
+                    if serial not in serials:
+                        last_err = RuntimeError(
+                            f"camera SN {serial} not found (found: {serials})"
+                        )
+                        serial = None
+                    else:
+                        cam = self._sdk.open_camera(serial)
+                        break
+            except Exception as exc:  # half-dead device / dll hiccup / open race
                 last_err = exc
+                cam = None
+                serial = None
                 if self._sdk is not None:
                     try:
                         self._sdk.dispose()
@@ -121,20 +175,20 @@ class ThorlabsBackend(CameraBackend):
                         break
                     self._sdk = None
             time.sleep(2)
-        if not serials:
+        if cam is None:
             raise RuntimeError(
                 "Thorlabs camera not found after %ds (%s). Check USB "
                 "connection (prefer direct, no hub)." % (self._retry, last_err)
             )
-        serial = self._serial or serials[0]
-        if serial not in serials:
-            self._close_sdk_only()
-            raise RuntimeError(
-                f"Thorlabs camera SN {serial} not found (found: {serials})"
-            )
-        self._cam = self._sdk.open_camera(serial)
-        cam = self._cam
+        self._cam = cam
         model = cam.model
+        sensor_type = int(cam.camera_sensor_type)
+        cfa_phase = None
+        if sensor_type == _BAYER_SENSOR_TYPE:
+            try:  # mono models error out of this query (observed code 1004)
+                cfa_phase = int(cam.color_filter_array_phase)
+            except Exception:
+                cfa_phase = None
         self._info = {
             "vendor": "thorlabs",
             "model": model,
@@ -145,6 +199,8 @@ class ThorlabsBackend(CameraBackend):
             "width": int(cam.sensor_width_pixels),
             "height": int(cam.sensor_height_pixels),
             "usb3": int(getattr(cam.usb_port_type, "value", 0)) == 2,
+            "pixel_format": _pixel_format(sensor_type, cfa_phase, cam.bit_depth),
+            "color": sensor_type == _BAYER_SENSOR_TYPE,
         }
         return dict(self._info)
 
