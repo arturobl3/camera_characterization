@@ -16,6 +16,14 @@ DEFAULT_ROI_FRAC = 0.5  # default analysis ROI: central fraction of each dimensi
 DEFAULT_ROI_SPECIM = (140, 290, 156, 306)  # SPECIM IQ ROI, see uniformity plot
 SAT_CLIP_FRAC = 0.002  # EMVA R4 Linear 6.6: saturation = <= 0.2% pixels at max
 
+# Frame means over a megapixel ROI are noise-limited to <0.01 DN16; clean
+# sessions show +-0.05 and long-exposure darks on healthy cameras drift by
+# ~1 DN16 (thermal). A spread above this threshold means a real black-level
+# step (the LP126CU firmware steps in 16-32 DN16 jumps while the sensor
+# heats) or a source jump -- the acquisition guard and analyze_dark both
+# flag it so a stepped stack never corrupts a sweep silently.
+FRAME_MEAN_SPREAD_WARN_DN16 = 4.0
+
 
 def central_roi(width, height, frac=DEFAULT_ROI_FRAC):
     """(r0, r1, c0, c1) covering the central ``frac`` of a width x height frame (pure).
@@ -112,10 +120,19 @@ def save_sequence(
     entries.append(meta)
     meta_path.write_text(json.dumps(entries, indent=2))
 
-    # quick quality report
+    # quick quality report + acquisition guard
     means = stack.mean(axis=(1, 2))
     stds = stack.std(axis=(1, 2))
     typer.echo(
         f"  saved {stem}.npy: {stack.shape}  frame mean {means.mean():.2f} "
         f"(±{means.std():.2f} across frames), spatial std {stds.mean():.2f}"
     )
+    spread = float(means.max() - means.min())
+    if spread > FRAME_MEAN_SPREAD_WARN_DN16:
+        typer.secho(
+            f"  ! WARNING {stem}: frame means spread {spread:.2f} DN16 across "
+            f"{stack.shape[0]} frames (expected < ~0.1) -- possible black-level "
+            "step or source jump; inspect this stack before trusting it",
+            fg=typer.colors.RED,
+            bold=True,
+        )

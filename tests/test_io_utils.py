@@ -6,6 +6,29 @@ from camchar import analyze as A
 from camchar.io_utils import camera_dir_name, central_roi, save_sequence, stem_for
 
 
+def _stack(frame_means, h=4, w=4):
+    return np.stack([np.full((h, w), v, dtype=np.uint16) for v in frame_means])
+
+
+class TestSaveSequenceGuard:
+    def test_warns_on_frame_mean_step(self, tmp_path, capsys):
+        info = {"vendor": "thorlabs", "model": "LP126CU", "sensor": ""}
+        save_sequence(
+            tmp_path, "dark", 0.569, 0, _stack([1600, 1600, 1088, 1088]), info
+        )
+        out = capsys.readouterr().out
+        assert "WARNING" in out
+        assert "black-level" in out
+        assert "512.00 DN16" in out  # spread 1600-1088 = 512
+
+    def test_no_warning_when_frame_means_stable(self, tmp_path, capsys):
+        info = {"vendor": "thorlabs", "model": "LP126CU", "sensor": ""}
+        save_sequence(tmp_path, "dark", 0.1, 0, _stack([1600] * 5), info)
+        out = capsys.readouterr().out
+        assert "WARNING" not in out
+        assert "saved" in out
+
+
 class TestStemFor:
     def test_integer_ms(self):
         assert stem_for("dark", 0.100, 0) == "dark_00100ms_g0"

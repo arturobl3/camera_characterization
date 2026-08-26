@@ -5,7 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.1.0] - 2026-09-01
+## [1.1.1] - 2026-08-26
+
+### Added
+
+- **`warmup-sensor` dark-signal mode**: `warmup-sensor` now falls back to
+  dark-signal stabilization (formerly the separate `stabilize-sensor` command,
+  which is removed) on cameras without a temperature API — continuous dark
+  exposures (lens cap ON) until the frame mean stays within tolerance over a
+  sliding window. `--mode auto|temp|signal` selects explicitly (auto =
+  temperature where available, else dark-signal; temp exits 1 on backends with
+  no temperature API; signal forces the soak on any camera). Exit 0 when
+  stable / 130 on Ctrl+C / 1 on abort.
+- **Acquisition guard**: `save_sequence` warns loudly (red) when frame means
+  within one stack spread beyond `FRAME_MEAN_SPREAD_WARN_DN16` (4 DN16) — the
+  signature of a firmware black-level step or a source jump (LP126CU
+  auto-black-level).
+- **Analyze-time step detection**: `roi_stats` now reports
+  `frame_mean_spread` per stack, and `analyze_dark` flags any dark row whose
+  frame means step (red warning naming the black-level cause and the affected
+  statistics) — recorded datasets are self-diagnosing, not silently corrupted.
+- **LP126CU black-level lesson (hardware behavior, Aug 2026)**: the sensor's
+  internal black-level controller steps the pedestal in integer-DN12 steps when
+  dark current × exposure exceeds ~1–2 DN12 during escalating dark sweeps.
+  Neither a higher `black_level` register nor heat-soaking prevents it; the
+  working protocol is to cap the dark sweep below the step threshold
+  (~300–400 ms) and drop flagged points. Documented in AGENTS.md / README /
+  the EMVA guide.
+
+## [1.1.0] - 2026-08-26
 
 ### Changed
 

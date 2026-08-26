@@ -66,6 +66,33 @@ Nsat, PRNU are effectively temperature-independent; consistency matters for
 comparability, and a dedicated i_d(T) sweep is needed for a temperature-aware
 simulator.
 
+**Firmware auto-black-level while warming (LP126CU lesson, Aug 2026).** Some
+camera firmwares re-zero their digital black pedestal mid-sweep — observed on the
+Thorlabs LP126CU: the sensor's internal black-level controller (no SDK control)
+steps the digital pedestal down in **integer DN12 steps** (measured −2, later
+±1 more) when the *accumulated dark signal* (dark current × exposure) exceeds
+~1–2 DN12 during an escalating dark sweep once the sensor is warm (dark current
+≳ 1 DN12/s). Setting the SDK `black_level` register higher does NOT stop it
+(verified: the same −2 DN12 step fires at BL=100); constant-exposure runs settle
+and are stable, escalating sweeps drift above the controller's target and step.
+A dark curve that rises, then **collapses below bias** (a dark mean below the
+short-exposure pedestal is physically impossible) is the tell-tale signature.
+Protocol:
+
+- **Cap the dark sweep below the step threshold**: at warm lab conditions that
+  is ~300–400 ms (steps fired at 390–569 ms in every observed session; dark×t ≈
+  1 DN12 there). The analysis extrapolates dark variance linearly past the dark
+  grid, so a capped sweep is fully valid — a long dark tail is not worth
+  corrupting the curve.
+- **Drop, don't fit through, any flagged point**: `camchar` warns loudly at
+  acquisition (per-frame "±X across frames" quality line; `save_sequence` guard
+  at >4 DN16 spread) and `camchar analyze` flags the affected dark rows
+  (`frame_mean_spread`) so recorded datasets are self-diagnosing.
+- **Heat-soaking does NOT prevent it**: `warmup-sensor` reaches thermal steady
+  state but the controller still steps during the following escalating sweep —
+  verified live (an engaged, stable controller at 1 s still stepped the next
+  sweep at 569 ms).
+
 ---
 
 ## Step 1 — Per-pixel temporal statistics
@@ -411,6 +438,9 @@ in the camera-noise-characterization skill.
 10. **Quantization floor** hides the true read noise on high-gain/large-pixel
     sensors — mark σr as an upper bound and use the empirical dark distribution
     for synthesis.
+11. **Firmware auto-black-level while warming** (LP126CU) — heat-soak before
+    dark sweeps; a dark mean below the bias reference is an offset step,
+    discard it. Watch the per-frame "±X across frames" acquisition line.
 
 ---
 
@@ -420,6 +450,7 @@ in the camera-noise-characterization skill.
 uv sync                      # install (uv-managed, CPython 3.11+)
 uv run camchar get-dark-frames  --vendor basler --exposures 1,10,100 ...  # ms!
 uv run camchar get-flat-frames  --vendor basler --exposures 1,2,5,...     # ms!
+uv run camchar warmup-sensor --vendor thorlabs                            # auto: dark-signal soak
 uv run camchar analyze --data data                                        # offline analysis
 uv run camchar source-stability-check ...                                 # qualify source BEFORE full run
 uv run pytest   # unit tests (offline, mocked backends)

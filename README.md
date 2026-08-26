@@ -54,7 +54,7 @@ Sub-ms / fractional-ms exposures use microsecond names (e.g. `flat_004500us`).
 camchar get-dark-frames --vendor playerone [--out ROOT] [--exposures MS,MS,...] [--frames N] [--gain G] [--notes TXT]
 camchar get-flat-frames --vendor playerone [--out ROOT] [--exposures MS,MS,...] [--frames N] [--gain G] [--notes TXT]
 camchar analyze --data DIR [--roi r0:r1:c0:c1] [--bands N]
-camchar warmup-sensor --vendor basler
+camchar warmup-sensor --vendor basler [--mode auto|temp|signal]
 camchar source-stability-check --vendor basler [--exposures MS,MS,...] [--frames N] [--gain G]
 camchar check-saturation --vendor basler [--exposures MS,MS,...] [--gain G]
 ```
@@ -64,10 +64,20 @@ and flat share 50 log-spaced exposures from 0.1–1000 ms (np.logspace), 10 fram
 gain 0.
 `--out` defaults to `data`; frames are written to
 `<out>/<vendor>_<model>_(<sensor>)/dark|flat/`.
-`warmup-sensor` runs continuous 0.1 s exposures and prints the timestamped sensor
-temperature; it declares the temperature stable once it stays within 0.3 °C over the
-last 2 min and auto-stops 1 min after that (Ctrl+C to stop earlier). Run it before
-acquiring so darks/flats are taken at thermal equilibrium.
+`warmup-sensor` runs continuous exposures until the camera reaches thermal
+equilibrium. `--mode auto` (default) uses the sensor temperature where the
+backend exposes it (Basler, Player One) — declares stable once it stays within
+0.3 °C over 2 min and auto-stops 1 min later — and **dark-signal stabilization**
+otherwise (Thorlabs has no temperature API): continuous darks (lens cap ON) until
+the frame mean stays within tolerance (0.5 DN16) over a sliding window (120 s).
+`--mode temp` forces the temperature path (exit 1 on a backend without an API);
+`--mode signal` forces the dark-signal soak on any camera. Ctrl+C stops early.
+On Thorlabs LP126 cameras the firmware's black-level controller steps the
+pedestal during escalating dark sweeps (integer-DN12 drops once dark-current ×
+exposure exceeds ~1-2 DN12, i.e. ~300-400 ms at warm lab conditions) — thermal
+steady state does NOT prevent it; cap the dark sweep accordingly and drop any
+stack the acquisition/analyze guards flag (a dark mean below the bias reference
+is the tell-tale).
 `source-stability-check` captures 4 consecutive frames at each exposure (default
 0.01/0.1/1/10/100/1000 ms, spanning the camera's 10 µs–1 s default sweep) and prints the percent deviation of each frame's spatial mean versus
 the first frame (the reference); any deviation above 0.1% triggers a per-exposure
@@ -247,9 +257,9 @@ software needs to run. Verified on the Kiralux LP126MU:
 - `--gain` is an integer gain index (0..480 on the LP126MU; the dB equivalent
   is recorded as `gain_db` in metadata);
 - exposures outside 28 µs .. 14.7 s are clamped with a warning;
-- **no sensor-temperature API exists in this SDK** — `warmup-sensor` refuses
-  to run against thorlabs cameras (thermal stability cannot be verified);
-  warm the camera up for a fixed time manually instead;
+- **no sensor-temperature API exists in this SDK** — `warmup-sensor` falls back
+  to dark-signal stabilization automatically (lens cap ON; `--mode signal`
+  forces it), or warm the camera up for a fixed time manually;
 - hot-pixel correction is disabled by `configure()` (it substitutes neighbor
   values and would corrupt variance statistics).
 

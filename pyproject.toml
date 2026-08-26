@@ -1,6 +1,6 @@
 [project]
 name = "camchar"
-version = "1.1.0"
+version = "1.1.1"
 description = "Camera PTC characterization toolkit (EMVA 1288 / photon transfer)"
 requires-python = ">=3.11"
 dependencies = [

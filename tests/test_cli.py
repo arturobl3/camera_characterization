@@ -72,7 +72,9 @@ class FailBackend(FakeBackend):
         raise RuntimeError("simulated USB hiccup")
 
 
-class NoTempBackend(FakeBackend):
+class NoTempSignalBackend(StableBackend):
+    """No temperature API but a working snap(): drives warmup's auto->signal path."""
+
     has_temperature = False
 
 
@@ -154,10 +156,67 @@ def test_warmup_aborted(monkeypatch):
     assert r.exit_code == 1
 
 
-def test_warmup_no_temperature_backend(monkeypatch):
-    r = invoke(monkeypatch, ["warmup-sensor", "--vendor", "basler"], NoTempBackend)
+def test_warmup_auto_signal_on_no_temp_backend(monkeypatch):
+    """Auto mode falls back to dark-signal stabilization without a temp API."""
+    monkeypatch.setattr(cli, "WARMUP_SIGNAL_WINDOW_S", 0.2)
+    monkeypatch.setattr(cli, "WARMUP_SIGNAL_PRINT_INTERVAL_S", 0.1)
+    r = invoke(
+        monkeypatch, ["warmup-sensor", "--vendor", "basler"], NoTempSignalBackend
+    )
+    assert r.exit_code == 0
+    assert "stabilized" in r.output
+
+
+def test_warmup_forced_temp_refused_on_no_temp_backend(monkeypatch):
+    r = invoke(
+        monkeypatch,
+        ["warmup-sensor", "--vendor", "basler", "--mode", "temp"],
+        NoTempSignalBackend,
+    )
     assert r.exit_code == 1
     assert "no sensor temperature" in r.output
+
+
+def test_warmup_signal_stable(monkeypatch):
+    monkeypatch.setattr(cli, "WARMUP_SIGNAL_WINDOW_S", 0.2)
+    monkeypatch.setattr(cli, "WARMUP_SIGNAL_PRINT_INTERVAL_S", 0.1)
+    r = invoke(
+        monkeypatch,
+        ["warmup-sensor", "--vendor", "basler", "--mode", "signal"],
+        StableBackend,
+    )
+    assert r.exit_code == 0
+    assert "stabilized" in r.output
+
+
+def test_warmup_signal_interrupted(monkeypatch):
+    monkeypatch.setattr(cli, "WARMUP_SIGNAL_RETRY_DELAY_S", 0)
+    r = invoke(
+        monkeypatch,
+        ["warmup-sensor", "--vendor", "basler", "--mode", "signal"],
+        InterruptBackend,
+    )
+    assert r.exit_code == 130
+
+
+def test_warmup_signal_aborted(monkeypatch):
+    monkeypatch.setattr(cli, "WARMUP_SIGNAL_MAX_CONSECUTIVE_FAILS", 2)
+    monkeypatch.setattr(cli, "WARMUP_SIGNAL_RETRY_DELAY_S", 0)
+    r = invoke(
+        monkeypatch,
+        ["warmup-sensor", "--vendor", "basler", "--mode", "signal"],
+        FailBackend,
+    )
+    assert r.exit_code == 1
+
+
+def test_warmup_invalid_mode(monkeypatch):
+    r = invoke(
+        monkeypatch,
+        ["warmup-sensor", "--vendor", "basler", "--mode", "bogus"],
+        StableBackend,
+    )
+    assert r.exit_code == 2
 
 
 def test_bad_exposures(monkeypatch):

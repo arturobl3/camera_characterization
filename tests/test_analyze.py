@@ -192,6 +192,20 @@ class TestTwoFrameStats:
         assert r["sat_frac"] == pytest.approx(1.0)
         assert r["tvar"] == pytest.approx(0.0)
 
+    def test_roi_stats_frame_mean_spread_detects_step(self):
+        # a global offset step mid-stack (LP126CU firmware): frame means split
+        stack = np.stack([np.full((16, 16), 1600, dtype=np.uint16)] * 3)
+        stack = np.concatenate(
+            [stack, np.stack([np.full((16, 16), 1568, dtype=np.uint16)] * 3)]
+        )
+        r = A.roi_stats(stack, (slice(None), slice(None)))
+        assert r["frame_mean_spread"] == pytest.approx(32.0)
+        # clean stack: only read-noise-level spread (0 on constant frames)
+        clean = np.stack([np.full((16, 16), 1600, dtype=np.uint16)] * 6)
+        assert A.roi_stats(clean, (slice(None), slice(None)))[
+            "frame_mean_spread"
+        ] == pytest.approx(0.0)
+
 
 class TestSnrTotal:
     EXTRAS = {"dsnu1288_dn": 1.0, "prnu1288_pct": 0.5}

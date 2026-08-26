@@ -29,6 +29,7 @@ import typer
 from .io_utils import (
     DEFAULT_ROI_FRAC,
     DEFAULT_ROI_SPECIM,
+    FRAME_MEAN_SPREAD_WARN_DN16,
     SAT_CLIP_FRAC,
     camera_dir_name,
     central_roi,
@@ -289,6 +290,7 @@ def roi_stats(stack, roi):
     """
     r = stack[:, roi[0], roi[1]].astype(np.float64)
     tf_t, tf_s, tf_ts, tf_ss = two_frame_stats(stack, roi)
+    frame_means = r.mean(axis=(1, 2))
     return {
         "mean": r.mean(),
         "tvar": r.var(axis=0, ddof=1).mean(),  # temporal variance, avg over pixels
@@ -297,6 +299,7 @@ def roi_stats(stack, roi):
         "tf_svar": tf_s,  # two-frame spatial variance (Eq. 32)
         "tf_tvar_scatter": tf_ts,  # pair-to-pair std of tf_tvar
         "tf_svar_scatter": tf_ss,  # pair-to-pair std of tf_svar
+        "frame_mean_spread": float(frame_means.max() - frame_means.min()),
         "sat_frac": float((r >= SAT_MAX_DN).mean()),  # EMVA 6.6 saturation test
     }
 
@@ -367,6 +370,15 @@ def analyze_dark(seq, roi):
             f"tf {s['tf_tvar']:9.2f}  nf {s['tvar']:9.2f}  "
             f"svar {s['svar']:8.2f}  tfs {s['tf_svar']:8.2f}"
         )
+        if s["frame_mean_spread"] > FRAME_MEAN_SPREAD_WARN_DN16:
+            typer.secho(
+                f"  ! {exp_s * 1000:8.1f} ms: frame means spread "
+                f"{s['frame_mean_spread']:.1f} DN16 across frames -- "
+                "black-level step or source jump; bias/dark-current/read-noise "
+                "from this stack are unreliable, exclude or re-acquire it",
+                fg=typer.colors.RED,
+                bold=True,
+            )
 
     out = fit_dark_stats(rows)
     out["rows"] = rows

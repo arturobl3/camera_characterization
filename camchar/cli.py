@@ -5,6 +5,7 @@ Usage examples:
    python -m camchar get-flat-frames --vendor playerone --exposures 10,50,100 --frames 20 \\
        --gain 0 --notes "green LED ~530nm, 30cm"
    python -m camchar warmup-sensor --vendor basler
+   python -m camchar warmup-sensor --vendor thorlabs   # auto: dark-signal mode
    python -m camchar source-stability-check --vendor basler
    python -m camchar check-saturation --vendor basler
 
@@ -55,6 +56,21 @@ WARMUP_STABLE_TOL_C = 0.3
 WARMUP_STOP_DELAY_S = 60.0
 WARMUP_MAX_CONSECUTIVE_FAILS = 5
 WARMUP_PRINT_INTERVAL_S = 5.0
+# warmup-sensor signal mode: dark-signal stabilization for cameras with no
+# temperature API (Thorlabs) -- or any camera, via --mode signal. Runs
+# continuous dark exposures and tracks the frame mean; stable when the spread
+# over a sliding window stays within tolerance. This is the heat-soak protocol:
+# cameras whose firmware re-zeros the black level while warming (LP126CU) must
+# be soaked until the mean flattens BEFORE a dark sweep, or the recalibration
+# fires mid-sweep and corrupts it. Tunables are constants (like the temperature
+# mode's WARMUP_* knobs) -- no CLI options.
+WARMUP_SIGNAL_EXPOSURE_MS = 1000.0
+WARMUP_SIGNAL_FRAMES = 2
+WARMUP_SIGNAL_TOL_DN16 = 0.5
+WARMUP_SIGNAL_WINDOW_S = 120.0
+WARMUP_SIGNAL_PRINT_INTERVAL_S = 5.0
+WARMUP_SIGNAL_MAX_CONSECUTIVE_FAILS = 5
+WARMUP_SIGNAL_RETRY_DELAY_S = 2.0
 SOURCE_STABILITY_EXPOSURES_MS = [0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
 SOURCE_STABILITY_FRAMES = 4
 SOURCE_STABILITY_TOL_PCT = 0.1
@@ -76,6 +92,19 @@ class Vendor(str, Enum):
     playerone = "playerone"
     basler = "basler"
     thorlabs = "thorlabs"
+
+
+class WarmupMode(str, Enum):
+    """Warmup stability criterion.
+
+    auto = temperature where the backend exposes one, else dark-signal
+    stabilization (Thorlabs has no temperature API). temp/signal force one
+    path explicitly.
+    """
+
+    auto = "auto"
+    temp = "temp"
+    signal = "signal"
 
 
 def _parse_exposures_ms(text):
@@ -150,16 +179,30 @@ def _run_sequence(vendor, out, exposures_ms, frames, gain, notes, seq_type):
     backend.close()
 
 
-def _warmup_sensor(vendor):
+def _warmup_sensor(vendor, mode):
+    """Heat-soak until stable; return exit code (0 stable, 130 Ctrl+C, 1 abort).
+
+    mode selects the stability criterion: 'temp' (sensor temperature),
+    'signal' (dark-signal frame-mean spread), or 'auto' (temperature where the
+    backend exposes one, else signal -- Thorlabs has no temperature API).
+    """
     backend = get_backend(vendor)
-    if not getattr(backend, "has_temperature", True):
+    has_temp = getattr(backend, "has_temperature", True)
+    if mode == "temp" and not has_temp:
         typer.secho(
             f"[warmup] vendor '{vendor}' exposes no sensor temperature "
-            "(no SDK API): thermal stability cannot be verified -- run the "
-            "camera for a fixed time manually instead, then take darks",
+            "(no SDK API): thermal stability cannot be verified -- use "
+            "--mode signal (dark-signal stabilization) instead",
             fg=typer.colors.RED,
         )
         return 1
+    if mode == "signal" or (mode == "auto" and not has_temp):
+        return _warmup_by_signal(backend, vendor)
+    return _warmup_by_temp(backend, vendor)
+
+
+def _warmup_by_temp(backend, vendor):
+    """Temperature-based warmup: continuous exposures until temp is stable."""
     typer.secho(
         f"[warmup] vendor={vendor}  opening camera...", bold=True, fg=typer.colors.CYAN
     )
@@ -261,6 +304,103 @@ def _warmup_sensor(vendor):
         fg=typer.colors.GREEN,
         bold=True,
     )
+    backend.close()
+    return 0
+
+
+def _warmup_by_signal(backend, vendor):
+    """Dark-signal stabilization: continuous darks until the frame mean is stable.
+
+    Used for cameras without a temperature API (auto mode) or via --mode
+    signal. Stability is judged on the dark signal itself (spread of frame
+    means over a sliding window) -- the condition the LP126CU auto-black-level
+    protocol needs. Lens cap ON required.
+    """
+    typer.secho(
+        f"[warmup] vendor={vendor}  opening camera...", bold=True, fg=typer.colors.CYAN
+    )
+    info = backend.open()
+    pixel = info["pixel_size_um"]
+    typer.echo(
+        f"[warmup] camera: {info['model']} SN={info['serial']} "
+        f"sensor={info['sensor']}" + (f" pixel={pixel:g}um" if pixel else "")
+    )
+    backend.configure(gain=0)
+    exp_s = WARMUP_SIGNAL_EXPOSURE_MS / 1000.0
+    typer.echo(
+        f"[warmup] no temperature API -- using dark-signal stabilization "
+        f"(lens cap ON): running continuous {WARMUP_SIGNAL_EXPOSURE_MS:g} ms "
+        f"darks ({WARMUP_SIGNAL_FRAMES} frames/check) until the frame mean is "
+        f"stable (spread <= {WARMUP_SIGNAL_TOL_DN16:g} DN16 over "
+        f"{WARMUP_SIGNAL_WINDOW_S:g} s); Ctrl+C to stop early"
+    )
+
+    t_start = time.time()
+    samples = []  # (t, frame mean)
+    mean = float("nan")
+    fails = 0
+    last_print = 0.0
+    try:
+        while True:
+            try:
+                stack = backend.snap(exp_s, WARMUP_SIGNAL_FRAMES)
+                fails = 0
+            except RuntimeError as exc:
+                fails += 1
+                if fails >= WARMUP_SIGNAL_MAX_CONSECUTIVE_FAILS:
+                    raise
+                typer.secho(
+                    f"[{time.strftime('%H:%M:%S')}] snap failed ({exc}), retrying",
+                    fg=typer.colors.YELLOW,
+                )
+                time.sleep(WARMUP_SIGNAL_RETRY_DELAY_S)
+                continue
+            now = time.time()
+            mean = float(stack.mean())
+            samples = [(t, v) for t, v in samples if now - t <= WARMUP_SIGNAL_WINDOW_S]
+            samples.append((now, mean))
+            span = now - samples[0][0]
+            spread = max(v for _, v in samples) - min(v for _, v in samples)
+            stamp = time.strftime("%H:%M:%S")
+            due = now - last_print >= WARMUP_SIGNAL_PRINT_INTERVAL_S
+            if now - t_start >= WARMUP_SIGNAL_WINDOW_S and spread <= (
+                WARMUP_SIGNAL_TOL_DN16
+            ):
+                typer.secho(
+                    f"[{stamp}] mean {mean:8.2f} DN16   stable "
+                    f"(spread {spread:.2f} DN16 over {span:.0f} s, "
+                    f"{(now - t_start) / 60:.1f} min total) -- sensor "
+                    "stabilized, run the sweep now",
+                    fg=typer.colors.GREEN,
+                    bold=True,
+                )
+                break
+            if due:
+                rate = (
+                    f"   {(mean - samples[0][1]) / span * 60:+.2f} DN16/min"
+                    if span >= 15
+                    else ""
+                )
+                typer.echo(
+                    f"[{stamp}] mean {mean:8.2f} DN16   spread "
+                    f"{spread:5.2f} over {span:4.0f} s{rate}"
+                )
+                last_print = now
+    except KeyboardInterrupt:
+        typer.secho(
+            f"\n[warmup] stopped by user at mean {mean:.2f} DN16 (not stabilized)",
+            fg=typer.colors.YELLOW,
+        )
+        backend.close()
+        return 130
+    except RuntimeError as exc:
+        typer.secho(
+            f"[warmup] aborted after {fails} consecutive failures: {exc}",
+            fg=typer.colors.RED,
+        )
+        backend.close()
+        return 1
+
     backend.close()
     return 0
 
@@ -559,9 +699,26 @@ def analyze(
 
 
 @app.command()
-def warmup_sensor(vendor: Vendor = _vendor_option()):
-    """Run the camera to warm it up to its steady-state operating temperature."""
-    rc = _warmup_sensor(vendor.value)
+def warmup_sensor(
+    vendor: Vendor = _vendor_option(),
+    mode: WarmupMode = typer.Option(
+        WarmupMode.auto,
+        help="stability criterion: auto (temperature where available, else "
+        "dark-signal), temp (temperature only), signal (dark-signal only; "
+        "lens cap ON)",
+    ),
+):
+    """Run the camera until it reaches thermal equilibrium.
+
+    auto uses the sensor temperature on backends that expose it (Basler,
+    Player One) and dark-signal stabilization otherwise (Thorlabs has no
+    temperature API): continuous darks (lens cap ON) until the frame mean
+    stops drifting. Note for Thorlabs LP126 cameras: reaching thermal steady
+    state does NOT stop the firmware's black-level controller from stepping
+    during an escalating dark sweep — cap the dark sweep below ~300-400 ms
+    and drop any step flagged by the acquisition/analyze guards.
+    """
+    rc = _warmup_sensor(vendor.value, mode.value)
     if rc:
         raise typer.Exit(rc)
 
